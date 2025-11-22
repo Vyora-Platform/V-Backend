@@ -1,24 +1,31 @@
+import dotenv from "dotenv";
+dotenv.config();
+
 // Allow self-signed certificates for Supabase pooler connections
-// This is required for Supabase's PgBouncer pooler (Transaction mode on port 6543)
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-import express, { type Request, Response, NextFunction } from "express";
+import express from "express";
 import cors from "cors";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 
-const app = express();
 
 // Configure CORS - allow requests from client dev server when running separately
 const isSeparatedMode = process.env.SEPARATE_CLIENT === "true";
-const allowedOrigins = isSeparatedMode 
-  ? ["http://localhost:5173", "http://127.0.0.1:5173"]
-  : undefined; // In integrated mode, same origin, no CORS needed
+
+const allowedOrigins = isSeparatedMode
+  ? [
+      "http://localhost:5173",
+      "http://127.0.0.1:5173",
+      "https://vyora.club/"
+    ]
+  : undefined;
+
+const app = express();
 
 if (allowedOrigins) {
   app.use(cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps or curl requests)
       if (!origin) return callback(null, true);
       
       if (allowedOrigins.includes(origin)) {
@@ -27,12 +34,13 @@ if (allowedOrigins) {
         callback(new Error('Not allowed by CORS'));
       }
     },
-    credentials: true, // Allow cookies and authorization headers
+    credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   }));
   log(`CORS enabled for origins: ${allowedOrigins.join(', ')}`);
 }
+
 
 // Increase body size limit to 50MB for handling image uploads and large forms
 app.use(express.json({ limit: '50mb' }));
