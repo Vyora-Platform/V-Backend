@@ -16,9 +16,13 @@ interface UploadConfig {
 }
 
 const DEFAULT_IMAGE_CONFIG: Omit<UploadConfig, 'category'> = {
-  maxSize: 10 * 1024 * 1024, // 10MB
-  allowedMimeTypes: ["image/jpeg", "image/png", "image/webp", "image/gif"],
-  allowedExtensions: [".jpg", ".jpeg", ".png", ".webp", ".gif"],
+  maxSize: 20 * 1024 * 1024, // 20MB - increased for all images
+  allowedMimeTypes: [
+    "image/jpeg", "image/png", "image/webp", "image/gif", "image/svg+xml",
+    "image/bmp", "image/tiff", "image/x-icon", "image/vnd.microsoft.icon",
+    "image/heic", "image/heif", "image/avif"
+  ],
+  allowedExtensions: [".jpg", ".jpeg", ".png", ".webp", ".gif", ".svg", ".bmp", ".tiff", ".ico", ".heic", ".heif", ".avif"],
   isPrivate: false,
 };
 
@@ -71,29 +75,29 @@ export async function handleFileUpload(
     vendorId,
     category,
     isPrivate = false,
-    maxSize = 10 * 1024 * 1024,
-    allowedMimeTypes = DEFAULT_IMAGE_CONFIG.allowedMimeTypes,
-    allowedExtensions = DEFAULT_IMAGE_CONFIG.allowedExtensions,
+    maxSize = 20 * 1024 * 1024,
     filenamePrefix = category,
   } = options;
 
-  // Validate file type
-  if (!file.mimetype || !allowedMimeTypes.includes(file.mimetype.toLowerCase())) {
-    throw new Error(`Invalid file type. Allowed types: ${allowedMimeTypes.join(", ")}`);
-  }
-
-  // Validate file size
+  // Only validate file size - allow any image type
   if (file.size > maxSize) {
     const sizeMB = (maxSize / (1024 * 1024)).toFixed(0);
     throw new Error(`File too large. Maximum size is ${sizeMB}MB`);
   }
 
+  // Check if it's an image type (allow all image types)
+  const isImage = file.mimetype && file.mimetype.startsWith('image/');
+  const isDocument = file.mimetype && (file.mimetype === 'application/pdf' || file.mimetype.startsWith('application/'));
+  
+  if (!isImage && !isDocument) {
+    throw new Error('Please upload an image or document file');
+  }
+
   // Sanitize filename and create unique name
   const timestamp = Date.now();
   const randomSuffix = Math.random().toString(36).substring(2, 8);
-  const ext = path.extname(file.originalname).toLowerCase();
-  const safeExt = allowedExtensions.includes(ext) ? ext : allowedExtensions[0];
-  const filename = `${filenamePrefix}-${timestamp}-${randomSuffix}${safeExt}`;
+  const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
+  const filename = `${filenamePrefix}-${timestamp}-${randomSuffix}${ext}`;
 
   // Upload to S3-compatible storage (Supabase)
   const result = await uploadToS3(file.buffer, {

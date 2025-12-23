@@ -47,18 +47,22 @@ function getBucket(category: string, isPrivate: boolean): string {
   }
 
   // Public media categories that go to public-assets bucket
+  // Products and services are public so they can be displayed on mini-websites without signature
   const publicMediaCategories = [
     "logo",
     "hero",
     "banner",
     "gallery",
+    "products",
+    "services",
+    "ledger-attachments", // Added for ledger receipts/bills to be publicly accessible
   ];
 
   if (publicMediaCategories.includes(category)) {
     return "public-assets";
   }
 
-  // Default to vendor-media for vendor-specific content (products, services, team, testimonial, coupon)
+  // Default to vendor-media for vendor-specific content (team, testimonial, coupon)
   return "vendor-media";
 }
 

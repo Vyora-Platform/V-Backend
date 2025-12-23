@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { Request, Response, NextFunction } from 'express';
+import { generateOTP, sendPasswordResetOTP } from './emailService';
 
 // JWT secret (should be in environment variable)
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-this-in-production';
@@ -295,6 +296,175 @@ export async function getCurrentUser(req: AuthRequest, res: Response) {
   } catch (error: any) {
     console.error('[Auth] Get current user error:', error);
     res.status(500).json({ error: error.message || 'Failed to get current user' });
+  }
+}
+
+/**
+ * Request password reset - sends OTP to email
+ */
+export async function requestPasswordReset(req: Request, res: Response) {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    // Import storage dynamically
+    const { supabaseStorage } = await import('./supabaseStorage');
+    const { storage } = await import('./storage');
+
+    // Check if user exists
+    const user = await storage.getUserByEmail(email.toLowerCase());
+
+    if (!user) {
+      // Don't reveal if email exists or not for security
+      return res.json({ 
+        success: true, 
+        message: 'If an account exists with this email, you will receive an OTP shortly.' 
+      });
+    }
+
+    // Generate OTP
+    const otp = generateOTP();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Store OTP in database
+    await supabaseStorage.createPasswordResetToken({
+      email: email.toLowerCase(),
+      otp,
+      expiresAt,
+      verified: false,
+      used: false,
+    });
+
+    // Send OTP via email
+    const emailSent = await sendPasswordResetOTP(email, otp);
+
+    if (!emailSent) {
+      return res.status(500).json({ error: 'Failed to send OTP email. Please try again.' });
+    }
+
+    console.log(`✅ [Auth] Password reset OTP sent to ${email}`);
+
+    res.json({ 
+      success: true, 
+      message: 'OTP has been sent to your email address.' 
+    });
+  } catch (error: any) {
+    console.error('[Auth] Password reset request error:', error);
+    res.status(500).json({ error: error.message || 'Failed to process password reset request' });
+  }
+}
+
+/**
+ * Verify OTP for password reset
+ */
+export async function verifyResetOTP(req: Request, res: Response) {
+  try {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+      return res.status(400).json({ error: 'Email and OTP are required' });
+    }
+
+    const normalizedEmail = email.toLowerCase();
+    
+    // Import storage dynamically
+    const { supabaseStorage } = await import('./supabaseStorage');
+
+    // Get token from database
+    const token = await supabaseStorage.getPasswordResetToken(normalizedEmail, otp);
+
+    if (!token) {
+      return res.status(400).json({ error: 'Invalid OTP. Please try again.' });
+    }
+
+    // Check if OTP has expired
+    if (new Date() > new Date(token.expiresAt)) {
+      await supabaseStorage.markPasswordResetTokenUsed(normalizedEmail, otp);
+      return res.status(400).json({ error: 'OTP has expired. Please request a new OTP.' });
+    }
+
+    // Mark OTP as verified in database
+    await supabaseStorage.verifyPasswordResetToken(normalizedEmail, otp);
+
+    console.log(`✅ [Auth] OTP verified for ${email}`);
+
+    res.json({ 
+      success: true, 
+      message: 'OTP verified successfully. You can now reset your password.' 
+    });
+  } catch (error: any) {
+    console.error('[Auth] OTP verification error:', error);
+    res.status(500).json({ error: error.message || 'Failed to verify OTP' });
+  }
+}
+
+/**
+ * Reset password with verified OTP
+ */
+export async function resetPassword(req: Request, res: Response) {
+  try {
+    const { email, otp, newPassword } = req.body;
+
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({ error: 'Email, OTP, and new password are required' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const normalizedEmail = email.toLowerCase();
+    
+    // Import storage dynamically
+    const { supabaseStorage } = await import('./supabaseStorage');
+    const { storage } = await import('./storage');
+
+    // Get token from database
+    const token = await supabaseStorage.getPasswordResetToken(normalizedEmail, otp);
+
+    if (!token) {
+      return res.status(400).json({ error: 'Invalid OTP. Please request a new OTP.' });
+    }
+
+    // Check if OTP has expired
+    if (new Date() > new Date(token.expiresAt)) {
+      await supabaseStorage.markPasswordResetTokenUsed(normalizedEmail, otp);
+      return res.status(400).json({ error: 'OTP has expired. Please request a new OTP.' });
+    }
+
+    // Check if OTP was verified
+    if (!token.verified) {
+      return res.status(400).json({ error: 'OTP has not been verified. Please verify your OTP first.' });
+    }
+
+    // Find user
+    const user = await storage.getUserByEmail(normalizedEmail);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Hash new password
+    const passwordHash = await hashPassword(newPassword);
+
+    // Update user password
+    await storage.updateUser(user.id, { passwordHash });
+
+    // Mark OTP as used in database
+    await supabaseStorage.markPasswordResetTokenUsed(normalizedEmail, otp);
+
+    console.log(`✅ [Auth] Password reset successful for ${email}`);
+
+    res.json({ 
+      success: true, 
+      message: 'Password has been reset successfully. You can now login with your new password.' 
+    });
+  } catch (error: any) {
+    console.error('[Auth] Password reset error:', error);
+    res.status(500).json({ error: error.message || 'Failed to reset password' });
   }
 }
 
