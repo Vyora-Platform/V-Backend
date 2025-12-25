@@ -7548,8 +7548,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Initialize Razorpay
       const razorpay = new Razorpay({
-        key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_RhHdGgNx7Uu3Rf',
-        key_secret: process.env.RAZORPAY_KEY_SECRET || 'vCCsk3Ik5YYplYYWWLTqSHKv'
+        key_id: process.env.RAZORPAY_KEY_ID || 'rzp_live_RugtddoC1ALdFB',
+        key_secret: process.env.RAZORPAY_KEY_SECRET || 'IHP66Sd1fwviFAG0ESRYOeua'
       });
 
       // Create Razorpay order
