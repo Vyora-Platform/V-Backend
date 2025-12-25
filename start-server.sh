@@ -20,8 +20,8 @@ export PORT=3000
 
 # export RAZORPAY_KEY_ID=rzp_test_Rg43DnQG1mP1qj
 # export RAZORPAY_KEY_SECRET=zNB7D2wUuAAH6zg3YhGri8e6
-export RAZORPAY_KEY_ID=rzp_test_RhHdGgNx7Uu3Rf
-export RAZORPAY_KEY_SECRET=vCCsk3Ik5YYplYYWWLTqSHKv
+export RAZORPAY_KEY_ID=rzp_live_RugtddoC1ALdFB
+export RAZORPAY_KEY_SECRET=IHP66Sd1fwviFAG0ESRYOeua
 
 echo "📁 Upload directories configured:"
 echo "   Public: $PUBLIC_OBJECT_SEARCH_PATHS"
