@@ -521,6 +521,11 @@ export interface IStorage {
     bestSellingItems: number;
     leastSellingItems: number;
   }>;
+  
+  // Service Stock Management
+  getServiceStockMovementsByVendor(vendorId: string): Promise<any[]>;
+  createServiceStockMovement(movement: any): Promise<any>;
+  updateServiceStock(vendorCatalogueId: string, quantity: number, movementType: 'in' | 'out'): Promise<any>;
 
   // Ledger Transactions (Hisab Kitab)
   getLedgerTransaction(id: string): Promise<LedgerTransaction | undefined>;
@@ -533,6 +538,7 @@ export interface IStorage {
     endDate?: Date;
   }): Promise<LedgerTransaction[]>;
   getLedgerTransactionsByCustomer(customerId: string): Promise<LedgerTransaction[]>;
+  getLedgerTransactionsBySupplier(supplierId: string): Promise<LedgerTransaction[]>;
   createLedgerTransaction(transaction: InsertLedgerTransaction): Promise<LedgerTransaction>;
   updateLedgerTransaction(id: string, updates: Partial<InsertLedgerTransaction>): Promise<LedgerTransaction | undefined>;
   deleteLedgerTransaction(id: string): Promise<boolean>;
@@ -5810,6 +5816,62 @@ export class MemStorage implements IStorage {
   }
 
   // ====================
+  // SERVICE STOCK MANAGEMENT
+  // ====================
+
+  private serviceStockMovements: Map<string, any> = new Map();
+
+  async getServiceStockMovementsByVendor(vendorId: string): Promise<any[]> {
+    return Array.from(this.serviceStockMovements.values())
+      .filter(m => m.vendorId === vendorId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  }
+
+  async createServiceStockMovement(movement: any): Promise<any> {
+    const id = `ssm-${nanoid()}`;
+    const now = new Date();
+    const newMovement = {
+      ...movement,
+      id,
+      createdAt: now,
+    };
+    this.serviceStockMovements.set(id, newMovement);
+    return newMovement;
+  }
+
+  async updateServiceStock(vendorCatalogueId: string, quantity: number, movementType: 'in' | 'out'): Promise<any> {
+    const catalogue = this.vendorCatalogues.get(vendorCatalogueId);
+    if (!catalogue) {
+      throw new Error("Service catalogue not found");
+    }
+
+    const previousStock = catalogue.stock || 0;
+    const change = movementType === 'in' ? quantity : -quantity;
+    const newStock = Math.max(0, previousStock + change);
+
+    // Update the catalogue stock
+    const updatedCatalogue = {
+      ...catalogue,
+      stock: newStock,
+      updatedAt: new Date(),
+    };
+    this.vendorCatalogues.set(vendorCatalogueId, updatedCatalogue);
+
+    // Create stock movement record
+    const movement = await this.createServiceStockMovement({
+      vendorId: catalogue.vendorId,
+      vendorCatalogueId,
+      movementType,
+      quantity: Math.abs(quantity),
+      previousStock,
+      newStock,
+      reason: movementType === 'in' ? 'Added' : 'Removed',
+    });
+
+    return { catalogue: updatedCatalogue, movement };
+  }
+
+  // ====================
   // LEDGER TRANSACTIONS (HISAB KITAB)
   // ====================
 
@@ -5865,6 +5927,12 @@ export class MemStorage implements IStorage {
       .sort((a, b) => b.transactionDate.getTime() - a.transactionDate.getTime());
   }
 
+  async getLedgerTransactionsBySupplier(supplierId: string): Promise<LedgerTransaction[]> {
+    return Array.from(this.ledgerTransactions.values())
+      .filter(t => t.supplierId === supplierId)
+      .sort((a, b) => b.transactionDate.getTime() - a.transactionDate.getTime());
+  }
+
   async createLedgerTransaction(transaction: InsertLedgerTransaction): Promise<LedgerTransaction> {
     const newTransaction: LedgerTransaction = {
       id: nanoid(),
@@ -5913,6 +5981,9 @@ export class MemStorage implements IStorage {
     transactionCount: number;
   }> {
     const transactions = await this.getLedgerTransactionsByVendor(vendorId, filters);
+    
+    // For balance calculation, exclude transactions marked with excludeFromBalance
+    const balanceTransactions = transactions.filter(t => !t.excludeFromBalance);
 
     const totalIn = transactions
       .filter(t => t.type === 'in')
@@ -5921,27 +5992,39 @@ export class MemStorage implements IStorage {
     const totalOut = transactions
       .filter(t => t.type === 'out')
       .reduce((sum, t) => sum + t.amount, 0);
+    
+    // Balance only counts non-excluded transactions
+    const balanceIn = balanceTransactions.filter(t => t.type === 'in').reduce((sum, t) => sum + t.amount, 0);
+    const balanceOut = balanceTransactions.filter(t => t.type === 'out').reduce((sum, t) => sum + t.amount, 0);
 
     return {
       totalIn,
       totalOut,
-      balance: totalIn - totalOut,
+      balance: balanceIn - balanceOut,
       transactionCount: transactions.length,
     };
   }
 
   async getCustomerLedgerBalance(customerId: string): Promise<number> {
     const transactions = await this.getLedgerTransactionsByCustomer(customerId);
+    
+    // Customer balance calculation - Khatabook style:
+    // "You Gave" (type=out) = Credit given = Customer owes you MORE
+    // "You Got" (type=in) = Payment received = Customer owes you LESS
+    // Balance = totalGave - totalGot = what customer owes you
+    // Positive = "You will GET", Negative = "You will GIVE"
+    // POS paid amounts (excludeFromBalance=true) are excluded
+    const balanceTransactions = transactions.filter(t => !t.excludeFromBalance);
 
-    const totalIn = transactions
-      .filter(t => t.type === 'in')
-      .reduce((sum, t) => sum + t.amount, 0);
-
-    const totalOut = transactions
+    const totalGave = balanceTransactions
       .filter(t => t.type === 'out')
       .reduce((sum, t) => sum + t.amount, 0);
 
-    return totalIn - totalOut;
+    const totalGot = balanceTransactions
+      .filter(t => t.type === 'in')
+      .reduce((sum, t) => sum + t.amount, 0);
+
+    return totalGave - totalGot;
   }
 
   async getRecurringLedgerTransactions(vendorId: string): Promise<LedgerTransaction[]> {
@@ -7869,10 +7952,16 @@ class HybridStorage implements IStorage {
   getExpensesByVendor(vendorId: string, filters?: { 
     category?: string; 
     paymentType?: string; 
+    status?: string;
+    supplierId?: string;
+    department?: string;
+    isRecurring?: boolean;
+    startDate?: Date;
+    endDate?: Date;
     dateFrom?: Date; 
     dateTo?: Date;
   }): Promise<Expense[]> {
-    console.log('[DATABASE] Fetching expenses from PostgreSQL:', vendorId);
+    console.log('[DATABASE] Fetching expenses from PostgreSQL:', vendorId, filters);
     return this.supabaseStorage.getExpensesByVendor!(vendorId, filters);
   }
 
@@ -8057,9 +8146,14 @@ class HybridStorage implements IStorage {
     return this.supabaseStorage.getQuotationItem(id);
   }
 
+  getQuotationItems(quotationId: string): Promise<QuotationItem[]> {
+    console.log('[DATABASE] Fetching quotation items from PostgreSQL:', quotationId);
+    return this.supabaseStorage.getQuotationItems(quotationId);
+  }
+
   getQuotationItemsByQuotation(quotationId: string): Promise<QuotationItem[]> {
     console.log('[DATABASE] Fetching quotation items from PostgreSQL:', quotationId);
-    return this.supabaseStorage.getQuotationItemsByQuotation(quotationId);
+    return this.supabaseStorage.getQuotationItems(quotationId);
   }
 
   createQuotationItem(item: InsertQuotationItem): Promise<QuotationItem> {
@@ -8147,12 +8241,67 @@ class HybridStorage implements IStorage {
     return this.memStorage.getStockAlert(id);
   }
 
-  getStockAlertsByVendor(vendorId: string): Promise<StockAlert[]> {
-    return this.memStorage.getStockAlertsByVendor(vendorId);
+  async getStockAlertsByVendor(vendorId: string, filters?: { status?: string; alertType?: string }): Promise<StockAlert[]> {
+    // Try supabase first, fallback to memStorage
+    if (this.supabaseStorage.getStockAlertsByVendor) {
+      try {
+        return await this.supabaseStorage.getStockAlertsByVendor(vendorId, filters);
+      } catch (error) {
+        console.error('[STOCK ALERTS] Error fetching from supabase:', error);
+      }
+    }
+    return this.memStorage.getStockAlertsByVendor(vendorId, filters);
   }
 
-  createStockAlert(alert: InsertStockAlert): Promise<StockAlert> {
+  async createStockAlert(alert: InsertStockAlert): Promise<StockAlert> {
+    // Try supabase first, fallback to memStorage
+    if (this.supabaseStorage.createStockAlert) {
+      try {
+        return await this.supabaseStorage.createStockAlert(alert);
+      } catch (error) {
+        console.error('[STOCK ALERTS] Error creating in supabase:', error);
+      }
+    }
     return this.memStorage.createStockAlert(alert);
+  }
+
+  async acknowledgeStockAlert(id: string, userId: string): Promise<StockAlert | undefined> {
+    // Try supabase first
+    if (this.supabaseStorage.acknowledgeStockAlert) {
+      try {
+        const result = await this.supabaseStorage.acknowledgeStockAlert(id, userId);
+        return result || undefined;
+      } catch (error) {
+        console.error('[STOCK ALERTS] Error acknowledging in supabase:', error);
+      }
+    }
+    return this.memStorage.acknowledgeStockAlert(id, userId);
+  }
+
+  async resolveStockAlert(id: string): Promise<StockAlert | undefined> {
+    // Try supabase first
+    if (this.supabaseStorage.resolveStockAlert) {
+      try {
+        const result = await this.supabaseStorage.resolveStockAlert(id);
+        return result || undefined;
+      } catch (error) {
+        console.error('[STOCK ALERTS] Error resolving in supabase:', error);
+      }
+    }
+    return this.memStorage.resolveStockAlert(id);
+  }
+
+  async dismissStockAlert(id: string): Promise<StockAlert | undefined> {
+    // Try supabase first
+    if (this.supabaseStorage.dismissStockAlert) {
+      try {
+        const result = await this.supabaseStorage.dismissStockAlert(id);
+        return result || undefined;
+      } catch (error) {
+        console.error('[STOCK ALERTS] Error dismissing in supabase:', error);
+      }
+    }
+    return this.memStorage.dismissStockAlert(id);
   }
 
   markStockAlertAsResolved(id: string): Promise<StockAlert | undefined> {
@@ -8273,6 +8422,11 @@ class HybridStorage implements IStorage {
   getLedgerTransactionsByCustomer(customerId: string): Promise<LedgerTransaction[]> {
     console.log('[DATABASE] Fetching ledger transactions for customer from PostgreSQL:', customerId);
     return this.supabaseStorage.getLedgerTransactionsByCustomer!(customerId);
+  }
+
+  getLedgerTransactionsBySupplier(supplierId: string): Promise<LedgerTransaction[]> {
+    console.log('[DATABASE] Fetching ledger transactions for supplier from PostgreSQL:', supplierId);
+    return this.supabaseStorage.getLedgerTransactionsBySupplier!(supplierId);
   }
 
   getLedgerTransactionsByVendor(vendorId: string, filters?: {
@@ -8911,6 +9065,19 @@ class HybridStorage implements IStorage {
     
     this.withdrawals.set(id, withdrawal);
     return withdrawal;
+  }
+
+  // Service Stock Management Methods
+  async getServiceStockMovementsByVendor(vendorId: string): Promise<any[]> {
+    return this.memStorage.getServiceStockMovementsByVendor(vendorId);
+  }
+
+  async createServiceStockMovement(movement: any): Promise<any> {
+    return this.memStorage.createServiceStockMovement(movement);
+  }
+
+  async updateServiceStock(vendorCatalogueId: string, quantity: number, movementType: 'in' | 'out'): Promise<any> {
+    return this.memStorage.updateServiceStock(vendorCatalogueId, quantity, movementType);
   }
 }
 

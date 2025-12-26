@@ -56,6 +56,8 @@ function getBucket(category: string, isPrivate: boolean): string {
     "products",
     "services",
     "ledger-attachments", // Added for ledger receipts/bills to be publicly accessible
+    "posters", // Greeting template posters - public for all vendors to access
+    "greeting-templates", // Alternative category for greeting templates
   ];
 
   if (publicMediaCategories.includes(category)) {
@@ -131,12 +133,12 @@ export async function uploadToS3(
       });
       url = await getSignedUrl(s3Client, getCommand, { expiresIn: 3600 });
     } else if (bucket === "vendor-media") {
-      // For vendor media, generate a signed URL (valid for 1 year)
+      // For vendor media, generate a signed URL (valid for 7 days - max allowed by S3 Signature v4)
       const getCommand = new GetObjectCommand({
         Bucket: bucket,
         Key: filePath,
       });
-      url = await getSignedUrl(s3Client, getCommand, { expiresIn: 31536000 });
+      url = await getSignedUrl(s3Client, getCommand, { expiresIn: 604800 }); // 7 days max
     } else {
       // For public files in public-assets bucket, construct public URL
       // Supabase public URL format: https://{project}.supabase.co/storage/v1/object/public/{bucket}/{path}

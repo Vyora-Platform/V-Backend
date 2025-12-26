@@ -22,6 +22,8 @@ export PORT=3000
 # export RAZORPAY_KEY_SECRET=zNB7D2wUuAAH6zg3YhGri8e6
 export RAZORPAY_KEY_ID=rzp_live_RugtddoC1ALdFB
 export RAZORPAY_KEY_SECRET=IHP66Sd1fwviFAG0ESRYOeua
+export SENDGRID_API_USER=apikey
+export SENDGRID_API_KEY=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
 
 
 echo "📁 Upload directories configured:"

@@ -110,6 +110,50 @@ export function requireRole(...roles: string[]) {
 }
 
 /**
+ * Middleware to validate vendor ownership
+ * Ensures vendors can only access their own data
+ * This prevents security issues where one vendor could access another's dashboard
+ */
+export function requireVendorOwnership(req: AuthRequest, res: Response, next: NextFunction) {
+  if (!req.user) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  // Admin users can access any vendor data
+  if (req.user.role === 'admin') {
+    return next();
+  }
+
+  // Get vendorId from URL params
+  const urlVendorId = req.params?.vendorId;
+  
+  // Get vendorId from the authenticated user's token
+  const tokenVendorId = req.user.vendorId;
+
+  // If URL has vendorId, validate ownership
+  if (urlVendorId && tokenVendorId) {
+    if (urlVendorId !== tokenVendorId) {
+      console.log(`[SECURITY] ❌ Vendor ownership mismatch: URL vendor ${urlVendorId} !== Token vendor ${tokenVendorId}`);
+      return res.status(403).json({ 
+        error: 'Access denied',
+        message: 'You can only access your own dashboard and data'
+      });
+    }
+  }
+
+  // If vendor role but no vendorId in token, block access
+  if (req.user.role === 'vendor' && !tokenVendorId) {
+    console.log(`[SECURITY] ❌ Vendor user without vendorId trying to access protected route`);
+    return res.status(403).json({ 
+      error: 'Access denied',
+      message: 'Vendor ID not found in authentication token'
+    });
+  }
+
+  next();
+}
+
+/**
  * Sign up handler
  */
 export async function signUp(req: Request, res: Response) {
@@ -173,6 +217,8 @@ export async function signUp(req: Request, res: Response) {
 
 /**
  * Sign in handler
+ * IMPORTANT: Only allows Admin, Employee, and Vendor roles to login
+ * Customers must use the mini-website customer login
  */
 export async function signIn(req: Request, res: Response) {
   try {
@@ -193,6 +239,17 @@ export async function signIn(req: Request, res: Response) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
+    // CRITICAL: Role restriction enforcement
+    // Only Admin, Employee, and Vendor roles are allowed to login here
+    // Customers must use the mini-website customer login
+    const allowedRoles = ['admin', 'employee', 'vendor'];
+    if (!allowedRoles.includes(user.role)) {
+      console.warn(`🚫 [Auth] Login denied for role: ${user.role} (${email})`);
+      return res.status(403).json({ 
+        error: 'Access denied. Only business accounts can login here. Customers should use the store login.' 
+      });
+    }
+
     // Check if user has a password hash
     if (!user.passwordHash) {
       return res.status(401).json({ error: 'Account not set up properly. Please contact support.' });
@@ -205,12 +262,15 @@ export async function signIn(req: Request, res: Response) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
-    // Get vendor ID if user is a vendor
+    // Get vendor ID and onboarding status if user is a vendor
     let vendorId: string | undefined;
+    let onboardingComplete: boolean = false;
+    
     if (user.role === 'vendor') {
       const vendor = await storage.getVendorByUserId(user.id);
       if (vendor) {
         vendorId = vendor.id;
+        onboardingComplete = vendor.onboardingComplete || false;
       }
     }
 
@@ -222,7 +282,7 @@ export async function signIn(req: Request, res: Response) {
       vendorId,
     });
 
-    console.log(`✅ [Auth] User logged in: ${email} (${user.role})`);
+    console.log(`✅ [Auth] User logged in: ${email} (${user.role}) - Onboarding: ${onboardingComplete}`);
 
     res.json({
       success: true,
@@ -233,6 +293,7 @@ export async function signIn(req: Request, res: Response) {
         username: user.username,
         role: user.role,
         vendorId,
+        onboardingComplete,
         modulePermissions: user.modulePermissions || [],
         name: (user as any).name,
         phone: (user as any).phone,

@@ -6,10 +6,8 @@ const transporter = nodemailer.createTransport({
   port: 2525,
   secure: false, // Use STARTTLS
   auth: {
-    // user: 'apikey',
-    // pass: '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',
-    user:process.env.SENDGRID_API_USER!,
-    pass:process.env.SENDGRID_API_KEY!
+    user: 'apikey',
+    pass: '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',
   },
   tls: {
     rejectUnauthorized: false,

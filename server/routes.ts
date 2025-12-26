@@ -1,9 +1,10 @@
-import type { Express } from "express";
+import type { Express, Request, Response, NextFunction } from "express";
 import { createServer, type Server } from "http";
 import { z } from "zod";
 import { nanoid } from "nanoid";
 import { storage } from "./storage";
 import { signUp, signIn, signOut, getCurrentUser } from "./auth";
+import { requireProSubscription, checkVendorProStatus } from "./subscriptionMiddleware";
 // import { ObjectStorageService, ObjectNotFoundError } from "./objectStorage"; // Object Storage requires bucket setup - using local data URLs for now
 import {
   insertCategorySchema,
@@ -48,6 +49,20 @@ import { insertVendorSubscriptionSchema } from "@shared/schema";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   console.log('[ROUTES] Starting route registration...');
+
+  // ===== PRO SUBSCRIPTION MIDDLEWARE =====
+  // Apply Pro subscription check to all vendor write operations
+  // Non-Pro vendors can VIEW all features but cannot perform write operations
+  // GET requests are always allowed, POST/PUT/PATCH/DELETE require Pro subscription
+  console.log('[ROUTES] Applying Pro subscription middleware for write operations...');
+  app.use('/api/vendors/:vendorId', requireProSubscription());
+  app.use('/api/vendor-products', requireProSubscription());
+  app.use('/api/vendor-catalogue', requireProSubscription());
+  app.use('/api/coupons', requireProSubscription());
+  app.use('/api/greeting-template-usage', requireProSubscription());
+  app.use('/api/pos', requireProSubscription());
+  app.use('/api/mini-websites', requireProSubscription());
+  console.log('[ROUTES] Pro subscription middleware applied!');
 
   // Initialize subscription plans on startup
   try {
@@ -1405,6 +1420,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Get single booking by ID
+  app.get("/api/bookings/:id", async (req, res) => {
+    try {
+      const booking = await storage.getBooking(req.params.id);
+      if (!booking) {
+        return res.status(404).json({ error: "Booking not found" });
+      }
+      res.json(booking);
+    } catch (error) {
+      console.error("❌ Error fetching booking:", error);
+      res.status(500).json({ error: "Failed to fetch booking" });
+    }
+  });
+
   // Create booking
   app.post("/api/bookings", async (req, res) => {
     try {
@@ -1465,6 +1494,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Delete booking
+  app.delete("/api/bookings/:id", async (req, res) => {
+    try {
+      const result = await storage.deleteBooking(req.params.id);
+      if (!result) {
+        return res.status(404).json({ error: "Booking not found" });
+      }
+      res.json({ success: true, message: "Booking deleted successfully" });
+    } catch (error) {
+      console.error("❌ Error deleting booking:", error);
+      res.status(500).json({ error: "Failed to delete booking" });
+    }
+  });
+
   // ====================
   // APPOINTMENTS (Physical Visit Appointments)
   // ====================
@@ -1486,6 +1529,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json(appointments);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch appointments" });
+    }
+  });
+
+  // Get single appointment by ID
+  app.get("/api/appointments/:id", async (req, res) => {
+    try {
+      const appointment = await storage.getAppointment(req.params.id);
+      if (!appointment) {
+        return res.status(404).json({ error: "Appointment not found" });
+      }
+      res.json(appointment);
+    } catch (error) {
+      console.error("❌ Error fetching appointment:", error);
+      res.status(500).json({ error: "Failed to fetch appointment" });
     }
   });
 
@@ -1551,6 +1608,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         error: "Failed to update appointment",
         message: error.message 
       });
+    }
+  });
+
+  // Delete appointment
+  app.delete("/api/appointments/:id", async (req, res) => {
+    try {
+      const result = await storage.deleteAppointment(req.params.id);
+      if (!result) {
+        return res.status(404).json({ error: "Appointment not found" });
+      }
+      res.json({ success: true, message: "Appointment deleted successfully" });
+    } catch (error) {
+      console.error("❌ Error deleting appointment:", error);
+      res.status(500).json({ error: "Failed to delete appointment" });
     }
   });
 
@@ -2109,17 +2180,44 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Get single employee
+  app.get("/api/employees/:id", async (req, res) => {
+    try {
+      const employee = await storage.getEmployee(req.params.id);
+      if (!employee) {
+        return res.status(404).json({ error: "Employee not found" });
+      }
+      res.json(employee);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch employee" });
+    }
+  });
+
   // Create employee
   app.post("/api/vendors/:vendorId/employees", async (req, res) => {
     try {
+      console.log("[API] Creating employee with data:", JSON.stringify(req.body, null, 2));
       const validatedData = insertEmployeeSchema.parse({
         ...req.body,
         vendorId: req.params.vendorId,
       });
+      console.log("[API] Validated employee data:", JSON.stringify(validatedData, null, 2));
       const employee = await storage.createEmployee(validatedData);
+      console.log("[API] Employee created successfully:", employee.id);
       res.status(201).json(employee);
-    } catch (error) {
-      res.status(400).json({ error: "Invalid employee data" });
+    } catch (error: any) {
+      console.error("[API] Employee creation error:", error);
+      if (error.name === "ZodError") {
+        const zodError = error as any;
+        const issues = zodError.errors?.map((e: any) => `${e.path.join('.')}: ${e.message}`).join(', ') || 'Validation failed';
+        return res.status(400).json({ error: `Validation error: ${issues}` });
+      }
+      // Check for database errors
+      if (error.code === '23505') {
+        // Unique constraint violation
+        return res.status(400).json({ error: "An employee with this email already exists" });
+      }
+      res.status(400).json({ error: error.message || "Invalid employee data" });
     }
   });
 
@@ -2587,9 +2685,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Get vendor's products
   app.get("/api/vendors/:vendorId/products", async (req, res) => {
     try {
+      console.log("📦 Fetching vendor products for vendor:", req.params.vendorId);
       const products = await storage.getVendorProductsByVendor(req.params.vendorId);
+      console.log("📦 Found products:", products.length);
       res.json(products);
     } catch (error) {
+      console.error("❌ Error fetching vendor products:", error);
       res.status(500).json({ error: "Failed to fetch vendor products" });
     }
   });
@@ -2626,6 +2727,21 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Get single vendor product by ID
+  app.get("/api/vendor-products/:id", async (req, res) => {
+    try {
+      console.log("📦 Fetching single vendor product:", req.params.id);
+      const product = await storage.getVendorProduct(req.params.id);
+      if (!product) {
+        return res.status(404).json({ error: "Product not found" });
+      }
+      res.json(product);
+    } catch (error) {
+      console.error("Failed to fetch vendor product:", error);
+      res.status(500).json({ error: "Failed to fetch product" });
+    }
+  });
+
   // Update vendor product
   app.patch("/api/vendor-products/:id", async (req, res) => {
     try {
@@ -2649,73 +2765,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: "Failed to delete product" });
-    }
-  });
-
-  // ====================
-  // EMPLOYEES
-  // ====================
-
-  // Get all employees for a vendor
-  app.get("/api/vendors/:vendorId/employees", async (req, res) => {
-    try {
-      const employees = await storage.getEmployeesByVendor(req.params.vendorId);
-      res.json(employees);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch employees" });
-    }
-  });
-
-  // Get single employee
-  app.get("/api/employees/:id", async (req, res) => {
-    try {
-      const employee = await storage.getEmployee(req.params.id);
-      if (!employee) {
-        return res.status(404).json({ error: "Employee not found" });
-      }
-      res.json(employee);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch employee" });
-    }
-  });
-
-  // Create employee
-  app.post("/api/vendors/:vendorId/employees", async (req, res) => {
-    try {
-      const validatedData = insertEmployeeSchema.parse({
-        ...req.body,
-        vendorId: req.params.vendorId,
-      });
-      const employee = await storage.createEmployee(validatedData);
-      res.status(201).json(employee);
-    } catch (error) {
-      res.status(400).json({ error: "Invalid employee data" });
-    }
-  });
-
-  // Update employee
-  app.patch("/api/employees/:id", async (req, res) => {
-    try {
-      const employee = await storage.updateEmployee(req.params.id, req.body);
-      if (!employee) {
-        return res.status(404).json({ error: "Employee not found" });
-      }
-      res.json(employee);
-    } catch (error) {
-      res.status(400).json({ error: "Failed to update employee" });
-    }
-  });
-
-  // Delete employee
-  app.delete("/api/employees/:id", async (req, res) => {
-    try {
-      const deleted = await storage.deleteEmployee(req.params.id);
-      if (!deleted) {
-        return res.status(404).json({ error: "Employee not found" });
-      }
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to delete employee" });
     }
   });
 
@@ -3980,18 +4029,23 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Get single quotation with items
   app.get("/api/quotations/:id", async (req, res) => {
     try {
+      console.log('[QUOTATION] Fetching quotation:', req.params.id);
       const quotation = await storage.getQuotation(req.params.id);
       if (!quotation) {
+        console.log('[QUOTATION] Quotation not found:', req.params.id);
         return res.status(404).json({ error: "Quotation not found" });
       }
+      console.log('[QUOTATION] Found quotation:', quotation.id);
       
       // Note: In production, verify req.user.vendorId === quotation.vendorId
       // This prevents cross-tenant data access
       
       const items = await storage.getQuotationItems(quotation.id);
+      console.log('[QUOTATION] Found items:', items.length);
       res.json({ ...quotation, items });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch quotation" });
+    } catch (error: any) {
+      console.error('[QUOTATION] Error fetching quotation:', error?.message || error);
+      res.status(500).json({ error: "Failed to fetch quotation", details: error?.message });
     }
   });
 
@@ -4031,12 +4085,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // SECURITY: Override vendorId from path parameter to prevent cross-tenant data manipulation
       data.vendorId = req.params.vendorId;
       
-      const validatedData = insertQuotationSchema.parse(data);
-      
-      // Generate quotation number if not provided
-      if (!validatedData.quotationNumber) {
-        validatedData.quotationNumber = await storage.generateQuotationNumber(req.params.vendorId);
+      // Generate quotation number BEFORE validation if not provided
+      if (!data.quotationNumber) {
+        data.quotationNumber = await storage.generateQuotationNumber(req.params.vendorId);
       }
+      
+      const validatedData = insertQuotationSchema.parse(data);
       
       const quotation = await storage.createQuotation(validatedData);
       res.status(201).json(quotation);
@@ -4092,10 +4146,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Get items for a quotation
   app.get("/api/quotations/:quotationId/items", async (req, res) => {
     try {
+      console.log('[QUOTATION] Fetching items for quotation:', req.params.quotationId);
       const items = await storage.getQuotationItems(req.params.quotationId);
+      console.log('[QUOTATION] Found items:', items.length);
       res.json(items);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch quotation items" });
+    } catch (error: any) {
+      console.error('[QUOTATION] Error fetching quotation items:', error?.message || error);
+      res.status(500).json({ error: "Failed to fetch quotation items", details: error?.message });
     }
   });
 
@@ -4448,52 +4505,30 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const reviews = await storage.getReviewsByMiniWebsite(miniWebsite.id, true);
       
       console.log("[PUBLIC API] Fetching services for vendor:", miniWebsite.vendorId);
-      // Get vendor services/products from catalog
+      // Get vendor services/products from catalog - AUTO-FETCH ALL active items
+      // This ensures newly added products/services/coupons automatically appear on the website
       const allServices = await storage.getVendorCataloguesByVendor(miniWebsite.vendorId);
       console.log("[PUBLIC API] Fetching products for vendor:", miniWebsite.vendorId);
       const allProducts = await storage.getVendorProductsByVendor(miniWebsite.vendorId);
       
-      // Filter services and products by selected IDs from the website configuration
-      const selectedCatalog = (miniWebsite as any).selectedCatalog || {};
-      const selectedServiceIds = selectedCatalog.services || [];
-      const selectedProductIds = selectedCatalog.products || [];
+      // Always show ALL active services and products (auto-add new items)
+      const services = allServices.filter((s: any) => s.isActive !== false);
+      const products = allProducts.filter((p: any) => p.isActive !== false);
       
-      // Filter only active items first
-      const activeServices = allServices.filter((s: any) => s.isActive !== false);
-      const activeProducts = allProducts.filter((p: any) => p.isActive !== false);
+      console.log("[PUBLIC API] Auto-fetched", services.length, "active services and", products.length, "active products");
       
-      // If specific items are selected, filter; otherwise show all active items
-      const services = selectedServiceIds.length > 0 
-        ? activeServices.filter((s: any) => selectedServiceIds.includes(s.id))
-        : activeServices;
-      const products = selectedProductIds.length > 0 
-        ? activeProducts.filter((p: any) => selectedProductIds.includes(p.id))
-        : activeProducts;
-      
-      console.log("[PUBLIC API] Filtered to", services.length, "services and", products.length, "products");
-      
-      // Fetch coupons for the vendor and filter by selectedCouponIds
+      // Fetch ALL active coupons for the vendor (auto-add new coupons)
       console.log("[PUBLIC API] Fetching coupons for vendor:", miniWebsite.vendorId);
       let coupons: any[] = [];
       try {
         const allCoupons = await storage.getCouponsByVendor(miniWebsite.vendorId);
-        const selectedCouponIds = (miniWebsite as any).selectedCouponIds || [];
         
-        // If selectedCouponIds exists, filter to only selected coupons; otherwise use all active coupons
-        if (selectedCouponIds.length > 0) {
-          coupons = allCoupons.filter((c: any) => 
-            selectedCouponIds.includes(c.id) && 
-            c.status === 'active' && 
-            (!c.expiryDate || new Date(c.expiryDate) > new Date())
-          );
-        } else {
-          // Fallback: show all active coupons if no specific selection
-          coupons = allCoupons.filter((c: any) => 
-            c.status === 'active' && 
-            (!c.expiryDate || new Date(c.expiryDate) > new Date())
-          );
-        }
-        console.log("[PUBLIC API] Found", coupons.length, "active coupons");
+        // Always show ALL active and non-expired coupons (auto-add new coupons)
+        coupons = allCoupons.filter((c: any) => 
+          c.status === 'active' && 
+          (!c.expiryDate || new Date(c.expiryDate) > new Date())
+        );
+        console.log("[PUBLIC API] Auto-fetched", coupons.length, "active coupons");
       } catch (err) {
         console.error("[PUBLIC API] Error fetching coupons:", err);
         coupons = [];
@@ -5729,6 +5764,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/vendors/:vendorId/products/:productId/stock-out", async (req, res) => {
     try {
       const { quantity, ...data } = req.body;
+      const { vendorId, productId } = req.params;
       
       // Strong validation guards
       if (!quantity || typeof quantity !== "number" || !Number.isInteger(quantity)) {
@@ -5741,7 +5777,63 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: "Quantity exceeds maximum allowed value" });
       }
       
-      const result = await storage.recordStockOut(req.params.productId, quantity, data);
+      const result = await storage.recordStockOut(productId, quantity, data);
+      
+      // Check stock level and create notification if low
+      const product = await storage.getVendorProduct(productId);
+      if (product) {
+        const config = await storage.getStockConfig(productId);
+        const minStock = config?.minimumStock || 10;
+        
+        if (product.stock <= minStock && product.stock > 0) {
+          // Create low stock alert
+          await storage.createStockAlert({
+            vendorId,
+            vendorProductId: productId,
+            itemType: 'product',
+            alertType: 'low_stock',
+            severity: 'medium',
+            message: `${product.name} stock is low (${product.stock} ${product.unit || 'units'} remaining)`,
+            currentStock: product.stock,
+            minimumStock: minStock,
+            status: 'active',
+          });
+
+          // Create notification
+          await storage.createNotification({
+            vendorId,
+            title: 'Low Stock Alert',
+            message: `${product.name} is running low on stock (${product.stock} ${product.unit || 'units'} remaining). Consider restocking soon.`,
+            type: 'stock_alert',
+            isRead: false,
+            actionUrl: '/vendor/stock-turnover',
+          });
+        } else if (product.stock === 0) {
+          // Create out of stock alert
+          await storage.createStockAlert({
+            vendorId,
+            vendorProductId: productId,
+            itemType: 'product',
+            alertType: 'out_of_stock',
+            severity: 'critical',
+            message: `${product.name} is out of stock!`,
+            currentStock: 0,
+            minimumStock: minStock,
+            status: 'active',
+          });
+
+          // Create notification
+          await storage.createNotification({
+            vendorId,
+            title: 'Out of Stock Alert',
+            message: `${product.name} is now out of stock! Add stock immediately to avoid losing sales.`,
+            type: 'stock_alert',
+            isRead: false,
+            actionUrl: '/vendor/stock-turnover',
+          });
+        }
+      }
+      
       res.status(201).json(result);
     } catch (error) {
       res.status(400).json({ error: error instanceof Error ? error.message : "Failed to record stock out" });
@@ -5777,6 +5869,340 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json(config);
     } catch (error) {
       res.status(400).json({ error: "Invalid config data" });
+    }
+  });
+
+  // POST /api/stock-configs - Create or update stock config with reminder and notification
+  app.post("/api/stock-configs", async (req, res) => {
+    try {
+      const { vendorProductId, vendorServiceId, minStockLevel, maxStockLevel, reorderPoint, reminderDate, reminderNote } = req.body;
+      
+      const isProduct = !!vendorProductId;
+      const itemId = vendorProductId || vendorServiceId;
+      const itemType = isProduct ? 'product' : 'service';
+      
+      if (!itemId) {
+        return res.status(400).json({ error: "vendorProductId or vendorServiceId is required" });
+      }
+
+      let config: any = null;
+      let itemName = "Item";
+      let vendorId = "";
+
+      if (isProduct) {
+        // Handle Product stock config
+        const product = await storage.getVendorProduct(vendorProductId);
+        if (product) {
+          itemName = product.name;
+          vendorId = product.vendorId;
+        }
+
+        // Get existing config or create new one for products
+        config = await storage.getStockConfig(vendorProductId);
+        
+        if (config) {
+          // Update existing config
+          config = await storage.updateStockConfig(config.id, {
+            minimumStock: minStockLevel || config.minimumStock,
+            reorderPoint: reorderPoint || config.reorderPoint,
+            enableLowStockAlerts: true,
+          });
+        } else {
+          // Create new config for product
+          config = await storage.createStockConfig({
+            vendorProductId: vendorProductId,
+            minimumStock: minStockLevel || 10,
+            reorderPoint: reorderPoint || 20,
+            reorderQuantity: maxStockLevel || 100,
+            expiryAlertDays: 30,
+            trackExpiry: false,
+            trackBatches: false,
+            trackWarranty: false,
+            enableLowStockAlerts: true,
+            enableExpiryAlerts: true,
+            notificationChannels: ['dashboard'],
+          });
+        }
+      } else {
+        // Handle Service stock config
+        const service = await storage.getVendorCatalogue(vendorServiceId);
+        if (service) {
+          itemName = service.name;
+          vendorId = service.vendorId;
+
+          // Enable stock tracking for this service
+          await storage.updateVendorCatalogue(vendorServiceId, {
+            trackStock: true,
+          });
+
+          // Return a virtual config for services
+          config = {
+            id: `svc-cfg-${vendorServiceId}`,
+            vendorCatalogueId: vendorServiceId,
+            minimumStock: minStockLevel || 5,
+            reorderPoint: reorderPoint || 10,
+            enableLowStockAlerts: true,
+          };
+        }
+      }
+
+      // Create stock alert for the configured reminder
+      if (vendorId) {
+        const alertMessage = reminderNote 
+          ? `Stock reminder set for ${itemName}: ${reminderNote}` 
+          : `Stock reminder configured for ${itemName} - Min: ${minStockLevel}, Reorder at: ${reorderPoint}`;
+        
+        // Create alert with proper fields based on item type
+        const alertData: any = {
+          vendorId,
+          itemType,
+          alertType: 'reminder_set',
+          severity: 'low',
+          message: alertMessage,
+          currentStock: null,
+          minimumStock: minStockLevel,
+          status: 'active',
+        };
+
+        if (isProduct) {
+          alertData.vendorProductId = vendorProductId;
+        } else {
+          alertData.vendorCatalogueId = vendorServiceId;
+        }
+        
+        await storage.createStockAlert(alertData);
+
+        // Create notification for the vendor
+        await storage.createNotification({
+          vendorId,
+          title: `Stock Reminder Set`,
+          message: alertMessage,
+          type: 'stock_alert',
+          isRead: false,
+          actionUrl: '/vendor/stock-turnover',
+        });
+
+        // If reminder date is set, create a scheduled alert
+        if (reminderDate) {
+          const scheduledAlertData: any = {
+            vendorId,
+            itemType,
+            alertType: 'scheduled_reminder',
+            severity: 'medium',
+            message: `Scheduled reminder for ${itemName}: ${reminderNote || 'Check stock levels'}`,
+            expiryDate: new Date(reminderDate),
+            status: 'active',
+          };
+
+          if (isProduct) {
+            scheduledAlertData.vendorProductId = vendorProductId;
+          } else {
+            scheduledAlertData.vendorCatalogueId = vendorServiceId;
+          }
+
+          await storage.createStockAlert(scheduledAlertData);
+        }
+      }
+
+      res.status(201).json(config || { success: true });
+    } catch (error: any) {
+      console.error("Error creating stock config:", error);
+      res.status(400).json({ error: "Failed to create stock config", details: error.message });
+    }
+  });
+
+  // ========== Service Stock Management ==========
+  
+  // Get service stock movements for a vendor
+  app.get("/api/vendors/:vendorId/service-stock-movements", async (req, res) => {
+    try {
+      const movements = await storage.getServiceStockMovementsByVendor(req.params.vendorId);
+      res.json(movements);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch service stock movements" });
+    }
+  });
+
+  // Stock In for service
+  app.post("/api/vendors/:vendorId/services/:serviceId/stock-in", async (req, res) => {
+    try {
+      const { quantity, reason, notes, userId } = req.body;
+      const { vendorId, serviceId } = req.params;
+
+      const service = await storage.getVendorCatalogue(serviceId);
+      if (!service) {
+        return res.status(404).json({ error: "Service not found" });
+      }
+
+      const previousStock = service.stock || 0;
+      const newStock = previousStock + quantity;
+
+      // Update service stock
+      await storage.updateVendorCatalogue(serviceId, {
+        stock: newStock,
+        trackStock: true,
+      });
+
+      // Create movement record
+      const movement = await storage.createServiceStockMovement({
+        vendorId,
+        vendorCatalogueId: serviceId,
+        movementType: 'in',
+        quantity,
+        previousStock,
+        newStock,
+        reason: reason || 'Added',
+        notes,
+        performedBy: userId,
+      });
+
+      // Check if stock was previously low and now resolved
+      const config = await storage.getStockConfig(serviceId);
+      if (config && previousStock <= config.minimumStock && newStock > config.minimumStock) {
+        // Resolve any active low stock alerts
+        const alerts = await storage.getStockAlertsByVendor(vendorId, { status: 'active' });
+        for (const alert of alerts) {
+          if (alert.vendorProductId === serviceId && (alert.alertType === 'low_stock' || alert.alertType === 'out_of_stock')) {
+            await storage.resolveStockAlert(alert.id);
+          }
+        }
+      }
+
+      res.status(201).json(movement);
+    } catch (error: any) {
+      console.error("Error adding service stock:", error);
+      res.status(400).json({ error: "Failed to add service stock", details: error.message });
+    }
+  });
+
+  // Stock Out for service
+  app.post("/api/vendors/:vendorId/services/:serviceId/stock-out", async (req, res) => {
+    try {
+      const { quantity, reason, notes, userId } = req.body;
+      const { vendorId, serviceId } = req.params;
+
+      const service = await storage.getVendorCatalogue(serviceId);
+      if (!service) {
+        return res.status(404).json({ error: "Service not found" });
+      }
+
+      const previousStock = service.stock || 0;
+      if (previousStock < quantity) {
+        return res.status(400).json({ error: "Insufficient stock" });
+      }
+
+      const newStock = previousStock - quantity;
+
+      // Update service stock
+      await storage.updateVendorCatalogue(serviceId, {
+        stock: newStock,
+        trackStock: true,
+      });
+
+      // Create movement record
+      const movement = await storage.createServiceStockMovement({
+        vendorId,
+        vendorCatalogueId: serviceId,
+        movementType: 'out',
+        quantity,
+        previousStock,
+        newStock,
+        reason: reason || 'Removed',
+        notes,
+        performedBy: userId,
+      });
+
+      // Check if stock is now low and create alert + notification
+      const minStock = 5; // Default min stock for services
+      
+      if (newStock <= minStock && newStock > 0) {
+        // Create low stock alert for service
+        await storage.createStockAlert({
+          vendorId,
+          vendorCatalogueId: serviceId,
+          itemType: 'service',
+          alertType: 'low_stock',
+          severity: 'medium',
+          message: `${service.name} stock is low (${newStock} remaining)`,
+          currentStock: newStock,
+          minimumStock: minStock,
+          status: 'active',
+        });
+
+        // Create notification
+        await storage.createNotification({
+          vendorId,
+          title: 'Low Stock Alert',
+          message: `${service.name} is running low on stock (${newStock} remaining). Consider adding more.`,
+          type: 'stock_alert',
+          isRead: false,
+          actionUrl: '/vendor/stock-turnover',
+        });
+      } else if (newStock === 0) {
+        // Create out of stock alert for service
+        await storage.createStockAlert({
+          vendorId,
+          vendorCatalogueId: serviceId,
+          itemType: 'service',
+          alertType: 'out_of_stock',
+          severity: 'critical',
+          message: `${service.name} is out of stock!`,
+          currentStock: 0,
+          minimumStock: minStock,
+          status: 'active',
+        });
+
+        // Create notification
+        await storage.createNotification({
+          vendorId,
+          title: 'Out of Stock Alert',
+          message: `${service.name} is now out of stock! Add stock immediately.`,
+          type: 'stock_alert',
+          isRead: false,
+          actionUrl: '/vendor/stock-turnover',
+        });
+      }
+
+      res.status(201).json(movement);
+    } catch (error: any) {
+      console.error("Error removing service stock:", error);
+      res.status(400).json({ error: "Failed to remove service stock", details: error.message });
+    }
+  });
+
+  // Get service stock turnover analytics
+  app.get("/api/vendors/:vendorId/service-stock-analytics", async (req, res) => {
+    try {
+      const catalogues = await storage.getVendorCataloguesByVendor(req.params.vendorId);
+      const trackingServices = catalogues.filter(c => c.trackStock);
+      
+      let totalStockValue = 0;
+      let lowStockItems = 0;
+      let highStockItems = 0;
+      let outOfStockItems = 0;
+
+      for (const service of trackingServices) {
+        const stock = service.stock || 0;
+        totalStockValue += stock * service.price;
+
+        if (stock === 0) {
+          outOfStockItems++;
+        } else if (stock <= 5) {
+          lowStockItems++;
+        } else if (stock >= 50) {
+          highStockItems++;
+        }
+      }
+
+      res.json({
+        totalStockValue,
+        lowStockItems,
+        highStockItems,
+        outOfStockItems,
+        totalServices: trackingServices.length,
+      });
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch service stock analytics" });
     }
   });
 
@@ -5918,6 +6344,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json(transactions);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch customer ledger transactions" });
+    }
+  });
+
+  // Get supplier's ledger transactions
+  app.get("/api/suppliers/:supplierId/ledger-transactions", async (req, res) => {
+    try {
+      const transactions = await storage.getLedgerTransactionsBySupplier(req.params.supplierId);
+      res.json(transactions);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch supplier ledger transactions" });
+    }
+  });
+
+  // Get single supplier by ID
+  app.get("/api/suppliers/:id", async (req, res) => {
+    try {
+      const supplier = await storage.getSupplier(req.params.id);
+      if (!supplier) {
+        return res.status(404).json({ error: "Supplier not found" });
+      }
+      res.json(supplier);
+    } catch (error) {
+      res.status(500).json({ error: "Failed to fetch supplier" });
     }
   });
 
@@ -7548,8 +7997,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Initialize Razorpay
       const razorpay = new Razorpay({
-        key_id: process.env.RAZORPAY_KEY_ID || 'rzp_live_RugtddoC1ALdFB',
-        key_secret: process.env.RAZORPAY_KEY_SECRET || 'IHP66Sd1fwviFAG0ESRYOeua'
+        key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_RhHdGgNx7Uu3Rf',
+        key_secret: process.env.RAZORPAY_KEY_SECRET || 'vCCsk3Ik5YYplYYWWLTqSHKv'
       });
 
       // Create Razorpay order
@@ -7567,83 +8016,253 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
       };
 
-      const order = await razorpay.orders.create(orderOptions);
+      // [RAZORPAY REQUEST] Log the complete request payload before making API call
+      console.log('[RAZORPAY REQUEST] Creating order with payload:', JSON.stringify(orderOptions, null, 2));
+      console.log('[RAZORPAY REQUEST] Timestamp:', new Date().toISOString());
+      console.log('[RAZORPAY REQUEST] Vendor ID:', vendor.id);
+      console.log('[RAZORPAY REQUEST] Subscription ID:', subscription.id);
+
+      let order;
+      try {
+        order = await razorpay.orders.create(orderOptions);
+        
+        // [RAZORPAY RESPONSE] Log the complete response payload after receiving response
+        console.log('[RAZORPAY RESPONSE] Order created successfully');
+        console.log('[RAZORPAY RESPONSE] Complete response:', JSON.stringify(order, null, 2));
+        console.log('[RAZORPAY RESPONSE] Order ID:', order.id);
+        console.log('[RAZORPAY RESPONSE] Order Status:', order.status);
+        console.log('[RAZORPAY RESPONSE] Timestamp:', new Date().toISOString());
+
+        // FAIL BY DEFAULT: Treat as failed if response is missing or status is not 'created'
+        if (!order || !order.id) {
+          console.log('[RAZORPAY ERROR] Order creation failed - Response missing or invalid');
+          console.log('[RAZORPAY ERROR] Invalid response:', JSON.stringify(order, null, 2));
+          
+          // Mark subscription as failed
+          await storage.updateVendorSubscription(subscription.id, {
+            paymentStatus: 'failed'
+          });
+          
+          return res.status(500).json({
+            error: "Payment order creation failed",
+            message: "Razorpay did not return a valid order",
+            transactionStatus: "failed"
+          });
+        }
+
+        // Only proceed if order status indicates success
+        if (order.status !== 'created') {
+          console.log('[RAZORPAY ERROR] Order status is not "created"');
+          console.log('[RAZORPAY ERROR] Actual status:', order.status);
+          
+          await storage.updateVendorSubscription(subscription.id, {
+            paymentStatus: 'failed'
+          });
+          
+          return res.status(500).json({
+            error: "Payment order creation failed",
+            message: `Razorpay order status: ${order.status}`,
+            transactionStatus: "failed"
+          });
+        }
+
+      } catch (razorpayError: any) {
+        // [RAZORPAY ERROR] Log complete error details
+        console.log('[RAZORPAY ERROR] Order creation API call failed');
+        console.log('[RAZORPAY ERROR] Error message:', razorpayError?.message || 'Unknown error');
+        console.log('[RAZORPAY ERROR] Error code:', razorpayError?.code || razorpayError?.error?.code || 'N/A');
+        console.log('[RAZORPAY ERROR] Full error object:', JSON.stringify(razorpayError, Object.getOwnPropertyNames(razorpayError), 2));
+        console.log('[RAZORPAY ERROR] Stack trace:', razorpayError?.stack || 'No stack trace available');
+        console.log('[RAZORPAY ERROR] Timestamp:', new Date().toISOString());
+        
+        // Mark subscription as failed
+        await storage.updateVendorSubscription(subscription.id, {
+          paymentStatus: 'failed'
+        });
+        
+        return res.status(500).json({
+          error: "Payment order creation failed",
+          message: razorpayError?.message || "Razorpay API call failed",
+          transactionStatus: "failed"
+        });
+      }
 
       // Update subscription with Razorpay order ID
       await storage.updateVendorSubscription(subscription.id, {
         razorpayOrderId: order.id
       });
 
+      console.log('[RAZORPAY REQUEST] Order created successfully, returning to client');
+
       res.json({
         orderId: order.id,
         amount: order.amount,
         currency: order.currency,
         subscriptionId: subscription.id,
-        razorpayKeyId: process.env.RAZORPAY_KEY_ID || 'rzp_live_RugtddoC1ALdFB'
+        razorpayKeyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_RhHdGgNx7Uu3Rf'
       });
 
     } catch (error: any) {
-      console.error("Error creating Razorpay order:", error);
+      // [RAZORPAY ERROR] Log any unexpected errors
+      console.log('[RAZORPAY ERROR] Unexpected error in create-payment endpoint');
+      console.log('[RAZORPAY ERROR] Error message:', error?.message || 'Unknown error');
+      console.log('[RAZORPAY ERROR] Error code:', error?.code || 'N/A');
+      console.log('[RAZORPAY ERROR] Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+      console.log('[RAZORPAY ERROR] Stack trace:', error?.stack || 'No stack trace available');
+      console.log('[RAZORPAY ERROR] Timestamp:', new Date().toISOString());
+      
       res.status(500).json({
         error: "Failed to create payment order",
-        message: error?.message || "Payment order creation failed"
+        message: error?.message || "Payment order creation failed",
+        transactionStatus: "failed"
       });
     }
   });
 
-  // Handle Razorpay payment success
+  // Handle Razorpay payment success - FAIL BY DEFAULT unless explicitly verified as success
   app.post("/api/vendor-subscriptions/payment-success", async (req, res) => {
+    // [RAZORPAY REQUEST] Log incoming payment verification request
+    console.log('[RAZORPAY REQUEST] Payment verification request received');
+    console.log('[RAZORPAY REQUEST] Timestamp:', new Date().toISOString());
+    console.log('[RAZORPAY REQUEST] Request body:', JSON.stringify(req.body, null, 2));
+    
     try {
-      console.log('[PAYMENT SUCCESS] Received payment success request:', req.body);
       const { subscriptionId, razorpayOrderId, razorpayPaymentId, razorpaySignature } = req.body;
 
+      // Validate required fields
       if (!subscriptionId || !razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+        console.log('[RAZORPAY ERROR] Missing required payment data');
+        console.log('[RAZORPAY ERROR] Received data:', { subscriptionId: !!subscriptionId, razorpayOrderId: !!razorpayOrderId, razorpayPaymentId: !!razorpayPaymentId, razorpaySignature: !!razorpaySignature });
         return res.status(400).json({
           error: "Missing required payment data",
-          message: "subscriptionId, razorpayOrderId, razorpayPaymentId, and razorpaySignature are required"
+          message: "subscriptionId, razorpayOrderId, razorpayPaymentId, and razorpaySignature are required",
+          transactionStatus: "failed"
         });
       }
 
-      // Verify payment signature (recommended for production)
-      // const expectedSignature = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      //   .update(razorpayOrderId + '|' + razorpayPaymentId)
-      //   .digest('hex');
-
-      // if (expectedSignature !== razorpaySignature) {
-      //   return res.status(400).json({ error: "Invalid payment signature" });
-      // }
-
-      // Update subscription with payment details and activate it
-      const updatedSubscription = await storage.updateVendorSubscription(subscriptionId, {
-        razorpayPaymentId,
-        paymentStatus: 'completed',
-        status: 'active'
+      // Initialize Razorpay
+      const razorpay = new Razorpay({
+        key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_RhHdGgNx7Uu3Rf',
+        key_secret: process.env.RAZORPAY_KEY_SECRET || 'vCCsk3Ik5YYplYYWWLTqSHKv'
       });
 
+      // FAIL BY DEFAULT: Verify payment status from Razorpay API
+      // Only mark as success if Razorpay explicitly confirms payment is captured/authorized
+      let paymentDetails: any = null;
+      let paymentVerified = false;
+      let paymentStatus = 'failed'; // Default to failed
+
+      try {
+        // [RAZORPAY REQUEST] Fetch payment details from Razorpay API
+        console.log('[RAZORPAY REQUEST] Fetching payment details from Razorpay');
+        console.log('[RAZORPAY REQUEST] Payment ID:', razorpayPaymentId);
+        console.log('[RAZORPAY REQUEST] Timestamp:', new Date().toISOString());
+        
+        paymentDetails = await razorpay.payments.fetch(razorpayPaymentId);
+        
+        // [RAZORPAY RESPONSE] Log payment details response
+        console.log('[RAZORPAY RESPONSE] Payment details received');
+        console.log('[RAZORPAY RESPONSE] Complete response:', JSON.stringify(paymentDetails, null, 2));
+        console.log('[RAZORPAY RESPONSE] Payment Status:', paymentDetails?.status);
+        console.log('[RAZORPAY RESPONSE] Payment Method:', paymentDetails?.method);
+        console.log('[RAZORPAY RESPONSE] Amount:', paymentDetails?.amount);
+        console.log('[RAZORPAY RESPONSE] Currency:', paymentDetails?.currency);
+        console.log('[RAZORPAY RESPONSE] Order ID:', paymentDetails?.order_id);
+        console.log('[RAZORPAY RESPONSE] Timestamp:', new Date().toISOString());
+
+        // CRITICAL: Only mark as success if Razorpay explicitly confirms success
+        // Valid success statuses: 'captured' (for auto-capture) or 'authorized' (for manual capture)
+        if (paymentDetails && (paymentDetails.status === 'captured' || paymentDetails.status === 'authorized')) {
+          paymentVerified = true;
+          paymentStatus = 'completed';
+          console.log('[RAZORPAY RESPONSE] ✅ Payment verified as SUCCESS');
+          console.log('[RAZORPAY RESPONSE] Payment status from Razorpay:', paymentDetails.status);
+        } else {
+          // FAIL BY DEFAULT: Any other status is treated as failed
+          console.log('[RAZORPAY ERROR] ❌ Payment NOT verified as success');
+          console.log('[RAZORPAY ERROR] Payment status from Razorpay:', paymentDetails?.status || 'MISSING');
+          console.log('[RAZORPAY ERROR] Expected: "captured" or "authorized"');
+          console.log('[RAZORPAY ERROR] Transaction marked as FAILED');
+          paymentStatus = 'failed';
+        }
+
+      } catch (razorpayError: any) {
+        // [RAZORPAY ERROR] Log complete error when fetching payment details fails
+        console.log('[RAZORPAY ERROR] Failed to fetch payment details from Razorpay');
+        console.log('[RAZORPAY ERROR] Error message:', razorpayError?.message || 'Unknown error');
+        console.log('[RAZORPAY ERROR] Error code:', razorpayError?.code || razorpayError?.error?.code || 'N/A');
+        console.log('[RAZORPAY ERROR] Full error object:', JSON.stringify(razorpayError, Object.getOwnPropertyNames(razorpayError), 2));
+        console.log('[RAZORPAY ERROR] Stack trace:', razorpayError?.stack || 'No stack trace available');
+        console.log('[RAZORPAY ERROR] Timestamp:', new Date().toISOString());
+        console.log('[RAZORPAY ERROR] Transaction marked as FAILED (API error/timeout)');
+        
+        // FAIL BY DEFAULT: If we can't verify, treat as failed
+        paymentStatus = 'failed';
+        paymentVerified = false;
+      }
+
+      // Also verify order status
+      let orderDetails: any = null;
+      let orderVerified = false;
+
+      try {
+        console.log('[RAZORPAY REQUEST] Fetching order details from Razorpay');
+        console.log('[RAZORPAY REQUEST] Order ID:', razorpayOrderId);
+        
+        orderDetails = await razorpay.orders.fetch(razorpayOrderId);
+        
+        console.log('[RAZORPAY RESPONSE] Order details received');
+        console.log('[RAZORPAY RESPONSE] Order response:', JSON.stringify(orderDetails, null, 2));
+        console.log('[RAZORPAY RESPONSE] Order Status:', orderDetails?.status);
+        console.log('[RAZORPAY RESPONSE] Timestamp:', new Date().toISOString());
+
+        // Order should be 'paid' for successful payment
+        if (orderDetails && orderDetails.status === 'paid') {
+          orderVerified = true;
+          console.log('[RAZORPAY RESPONSE] ✅ Order verified as PAID');
+        } else {
+          console.log('[RAZORPAY ERROR] ❌ Order NOT verified as paid');
+          console.log('[RAZORPAY ERROR] Order status from Razorpay:', orderDetails?.status || 'MISSING');
+        }
+
+      } catch (orderError: any) {
+        console.log('[RAZORPAY ERROR] Failed to fetch order details from Razorpay');
+        console.log('[RAZORPAY ERROR] Error message:', orderError?.message || 'Unknown error');
+        console.log('[RAZORPAY ERROR] Full error object:', JSON.stringify(orderError, Object.getOwnPropertyNames(orderError), 2));
+        console.log('[RAZORPAY ERROR] Timestamp:', new Date().toISOString());
+      }
+
+      // FINAL VERIFICATION: Both payment and order must be verified for success
+      const isTransactionSuccessful = paymentVerified && paymentStatus === 'completed';
+
+      console.log('[RAZORPAY RESPONSE] Final verification result:');
+      console.log('[RAZORPAY RESPONSE] Payment Verified:', paymentVerified);
+      console.log('[RAZORPAY RESPONSE] Order Verified:', orderVerified);
+      console.log('[RAZORPAY RESPONSE] Transaction Successful:', isTransactionSuccessful);
+
+      // Update subscription based on verification result
+      const subscriptionUpdate: any = {
+        razorpayPaymentId,
+        paymentStatus: isTransactionSuccessful ? 'completed' : 'failed',
+        status: isTransactionSuccessful ? 'active' : 'pending'
+      };
+
+      const updatedSubscription = await storage.updateVendorSubscription(subscriptionId, subscriptionUpdate);
+
       if (!updatedSubscription) {
-        return res.status(404).json({ error: "Subscription not found" });
+        console.log('[RAZORPAY ERROR] Subscription not found:', subscriptionId);
+        return res.status(404).json({ 
+          error: "Subscription not found",
+          transactionStatus: "failed"
+        });
       }
 
       // Get plan details for billing history
       const plan = await storage.getSubscriptionPlan(updatedSubscription.planId);
 
-      // Create billing history record for successful payment
+      // Create billing history record
       try {
-        // Fetch order details from Razorpay to get the amount
-        const razorpay = new Razorpay({
-          key_id: process.env.RAZORPAY_KEY_ID || 'rzp_live_RugtddoC1ALdFB',
-          key_secret: process.env.RAZORPAY_KEY_SECRET || 'IHP66Sd1fwviFAG0ESRYOeua'
-        });
-
-        let orderAmount = '0';
-        try {
-          const orderDetails = await razorpay.orders.fetch(razorpayOrderId);
-          orderAmount = (orderDetails.amount / 100).toString(); // Convert from paisa to rupees
-        } catch (orderError) {
-          console.warn('[BILLING] Could not fetch order details from Razorpay, using default amount');
-          // Use a default amount or try to get it from the plan
-          orderAmount = plan?.price || '0';
-        }
+        const orderAmount = orderDetails ? (orderDetails.amount / 100).toString() : (plan?.price || '0');
 
         const billingData = {
           vendorId: updatedSubscription.vendorId,
@@ -7651,10 +8270,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
           subscriptionId: subscriptionId,
           amount: orderAmount,
           currency: "INR",
-          status: "succeeded",
+          status: isTransactionSuccessful ? "succeeded" : "failed",
           paymentMethod: "razorpay",
           paymentId: razorpayPaymentId,
-          description: `Payment for subscription plan - Order ${razorpayOrderId}`,
+          description: isTransactionSuccessful 
+            ? `Payment for subscription plan - Order ${razorpayOrderId}` 
+            : `Failed payment for subscription plan - Order ${razorpayOrderId}`,
           periodStart: updatedSubscription.currentPeriodStart,
           periodEnd: updatedSubscription.currentPeriodEnd,
           stripeInvoiceId: null,
@@ -7662,32 +8283,61 @@ export async function registerRoutes(app: Express): Promise<Server> {
           razorpayOrderId: razorpayOrderId,
           razorpayPaymentId: razorpayPaymentId,
           metadata: {
-            subscriptionActivated: true,
+            subscriptionActivated: isTransactionSuccessful,
             planName: plan?.name || 'Unknown Plan',
-            billingInterval: plan?.billingInterval || 'monthly'
+            billingInterval: plan?.billingInterval || 'monthly',
+            razorpayPaymentStatus: paymentDetails?.status || 'unknown',
+            razorpayOrderStatus: orderDetails?.status || 'unknown',
+            verificationResult: {
+              paymentVerified,
+              orderVerified,
+              transactionSuccessful: isTransactionSuccessful
+            }
           }
         };
 
-        console.log('[BILLING] Creating billing history with data:', billingData);
+        console.log('[BILLING] Creating billing history with data:', JSON.stringify(billingData, null, 2));
         const billingResult = await storage.createBillingHistory(billingData);
         console.log('[BILLING] Created billing history successfully:', billingResult.id);
-      } catch (billingError) {
-        console.error('[BILLING] Failed to create billing history:', billingError);
-        console.error('[BILLING] Error details:', billingError?.message, billingError?.stack);
-        // Don't fail the payment if billing history creation fails
+      } catch (billingError: any) {
+        console.log('[BILLING] Failed to create billing history:', billingError?.message);
+        console.log('[BILLING] Error details:', billingError?.stack);
+        // Don't fail the response if billing history creation fails
       }
 
+      // Return appropriate response based on verification result
+      if (isTransactionSuccessful) {
+        console.log('[RAZORPAY RESPONSE] ✅ Transaction completed successfully');
       res.json({
         success: true,
         message: "Payment processed successfully",
-        subscription: updatedSubscription
+          subscription: updatedSubscription,
+          transactionStatus: "success"
+        });
+      } else {
+        console.log('[RAZORPAY ERROR] ❌ Transaction failed - not marking as successful');
+        res.status(400).json({
+          success: false,
+          error: "Payment verification failed",
+          message: "Razorpay did not confirm payment success",
+          razorpayPaymentStatus: paymentDetails?.status || 'unknown',
+          transactionStatus: "failed"
       });
+      }
 
     } catch (error: any) {
-      console.error("Error processing payment success:", error);
+      // [RAZORPAY ERROR] Log any unexpected errors
+      console.log('[RAZORPAY ERROR] Unexpected error in payment-success endpoint');
+      console.log('[RAZORPAY ERROR] Error message:', error?.message || 'Unknown error');
+      console.log('[RAZORPAY ERROR] Error code:', error?.code || 'N/A');
+      console.log('[RAZORPAY ERROR] Full error object:', JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+      console.log('[RAZORPAY ERROR] Stack trace:', error?.stack || 'No stack trace available');
+      console.log('[RAZORPAY ERROR] Timestamp:', new Date().toISOString());
+      
       res.status(500).json({
         error: "Failed to process payment",
-        message: error?.message || "Payment processing failed"
+        message: error?.message || "Payment processing failed",
+        transactionStatus: "failed"
       });
     }
   });
@@ -8590,6 +9240,38 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error: any) {
       console.error("Error updating referral status:", error);
       res.status(400).json({ error: error.message || "Failed to update referral" });
+    }
+  });
+
+  // Validate a referral code (for onboarding)
+  app.get("/api/referral-code/:code/validate", async (req, res) => {
+    try {
+      const { code } = req.params;
+      
+      if (!code || code.length < 6) {
+        return res.status(400).json({ valid: false, error: "Invalid referral code format" });
+      }
+      
+      // The referral code is the first 8 characters of the vendor ID
+      // Find a vendor whose ID starts with this code
+      const vendors = await storage.getVendors();
+      const referrerVendor = vendors.find(v => v.id.toLowerCase().startsWith(code.toLowerCase()));
+      
+      if (!referrerVendor) {
+        return res.status(404).json({ valid: false, error: "Referral code not found" });
+      }
+      
+      // Return success with referrer info
+      res.json({
+        valid: true,
+        referrerId: referrerVendor.id,
+        referrerName: referrerVendor.businessName,
+        referrerOwner: referrerVendor.ownerName,
+        message: `Referred by ${referrerVendor.businessName}`
+      });
+    } catch (error: any) {
+      console.error("Error validating referral code:", error);
+      res.status(500).json({ valid: false, error: error.message || "Failed to validate referral code" });
     }
   });
 

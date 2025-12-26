@@ -124,6 +124,9 @@ import {
   type InsertLedgerTransaction,
   type StockMovement,
   type InsertStockMovement,
+  stockAlerts,
+  type StockAlert,
+  type InsertStockAlert,
   type Bill,
   type InsertBill,
   type BillItem,
@@ -989,6 +992,12 @@ export class SupabaseStorage implements Partial<IStorage> {
   async getExpensesByVendor(vendorId: string, filters?: { 
     category?: string; 
     paymentType?: string; 
+    status?: string;
+    supplierId?: string;
+    department?: string;
+    isRecurring?: boolean;
+    startDate?: Date;
+    endDate?: Date;
     dateFrom?: Date; 
     dateTo?: Date;
   }): Promise<Expense[]> {
@@ -1001,11 +1010,28 @@ export class SupabaseStorage implements Partial<IStorage> {
     if (filters?.paymentType) {
       conditions.push(eq(expenses.paymentType, filters.paymentType));
     }
+
+    if (filters?.status) {
+      conditions.push(eq(expenses.status, filters.status));
+    }
+
+    if (filters?.supplierId) {
+      conditions.push(eq(expenses.supplierId, filters.supplierId));
+    }
+
+    if (filters?.department) {
+      conditions.push(eq(expenses.department, filters.department));
+    }
+
+    if (filters?.isRecurring !== undefined) {
+      conditions.push(eq(expenses.isRecurring, filters.isRecurring));
+    }
     
     return await db
       .select()
       .from(expenses)
-      .where(and(...conditions));
+      .where(and(...conditions))
+      .orderBy(desc(expenses.expenseDate));
   }
 
   async getExpense(id: string): Promise<Expense | undefined> {
@@ -2547,8 +2573,29 @@ export class SupabaseStorage implements Partial<IStorage> {
 
   async createLedgerTransaction(transaction: InsertLedgerTransaction): Promise<LedgerTransaction> {
     const id = `lt-${nanoid()}`;
-    const result = await db.insert(ledgerTransactions).values({ ...transaction, id, createdAt: new Date() }).returning();
-    return result[0];
+    
+    // Create a clean transaction object, excluding supplierId if null to avoid column not found errors
+    // The supplierId column may not exist in older database schemas
+    const cleanTransaction: any = { ...transaction, id, createdAt: new Date() };
+    
+    // Remove supplierId if it's null/undefined to prevent insertion errors when column doesn't exist
+    if (cleanTransaction.supplierId === null || cleanTransaction.supplierId === undefined) {
+      delete cleanTransaction.supplierId;
+    }
+    
+    try {
+      const result = await db.insert(ledgerTransactions).values(cleanTransaction).returning();
+      return result[0];
+    } catch (error: any) {
+      // If supplier_id column doesn't exist, retry without it
+      if (error?.code === '42703' && error?.message?.includes('supplier_id')) {
+        console.log('[DB] supplier_id column not found, retrying without it');
+        delete cleanTransaction.supplierId;
+        const result = await db.insert(ledgerTransactions).values(cleanTransaction).returning();
+        return result[0];
+      }
+      throw error;
+    }
   }
 
   async getLedgerTransactionsByCustomer(customerId: string): Promise<LedgerTransaction[]> {
@@ -2557,12 +2604,49 @@ export class SupabaseStorage implements Partial<IStorage> {
       .orderBy(desc(ledgerTransactions.transactionDate));
   }
 
+  async getLedgerTransactionsBySupplier(supplierId: string): Promise<LedgerTransaction[]> {
+    try {
+      return await db.select().from(ledgerTransactions)
+        .where(eq(ledgerTransactions.supplierId, supplierId))
+        .orderBy(desc(ledgerTransactions.transactionDate));
+    } catch (error: any) {
+      // If supplier_id column doesn't exist, return empty array
+      if (error?.code === '42703' && error?.message?.includes('supplier_id')) {
+        console.log('[DB] supplier_id column not found, returning empty array');
+        return [];
+      }
+      throw error;
+    }
+  }
+
   async updateLedgerTransaction(id: string, updates: Partial<InsertLedgerTransaction>): Promise<LedgerTransaction | undefined> {
-    const result = await db.update(ledgerTransactions)
-      .set({ ...updates, updatedAt: new Date() })
-      .where(eq(ledgerTransactions.id, id))
-      .returning();
-    return result[0];
+    // Create clean updates object, excluding supplierId if null to avoid column not found errors
+    const cleanUpdates: any = { ...updates, updatedAt: new Date() };
+    
+    // Remove supplierId if it's null/undefined to prevent update errors when column doesn't exist
+    if (cleanUpdates.supplierId === null || cleanUpdates.supplierId === undefined) {
+      delete cleanUpdates.supplierId;
+    }
+    
+    try {
+      const result = await db.update(ledgerTransactions)
+        .set(cleanUpdates)
+        .where(eq(ledgerTransactions.id, id))
+        .returning();
+      return result[0];
+    } catch (error: any) {
+      // If supplier_id column doesn't exist, retry without it
+      if (error?.code === '42703' && error?.message?.includes('supplier_id')) {
+        console.log('[DB] supplier_id column not found, retrying update without it');
+        delete cleanUpdates.supplierId;
+        const result = await db.update(ledgerTransactions)
+          .set(cleanUpdates)
+          .where(eq(ledgerTransactions.id, id))
+          .returning();
+        return result[0];
+      }
+      throw error;
+    }
   }
 
   async deleteLedgerTransaction(id: string): Promise<boolean> {
@@ -2598,22 +2682,38 @@ export class SupabaseStorage implements Partial<IStorage> {
     
     console.log(`[DB] getLedgerSummary - Found ${transactions.length} transactions`);
     
+    // For balance calculation, exclude transactions marked with excludeFromBalance
+    // This excludes POS paid amounts (product exchange) from net balance
+    const balanceTransactions = transactions.filter(t => !t.excludeFromBalance);
+    
+    // Total in/out shows all transactions including excluded ones
     const totalIn = transactions.filter(t => t.type === 'in').reduce((sum, t) => sum + t.amount, 0);
     const totalOut = transactions.filter(t => t.type === 'out').reduce((sum, t) => sum + t.amount, 0);
+    
+    // Balance only counts non-excluded transactions
+    const balanceIn = balanceTransactions.filter(t => t.type === 'in').reduce((sum, t) => sum + t.amount, 0);
+    const balanceOut = balanceTransactions.filter(t => t.type === 'out').reduce((sum, t) => sum + t.amount, 0);
     
     return {
       totalIn,
       totalOut,
-      balance: totalIn - totalOut,
+      balance: balanceIn - balanceOut,
       transactionCount: transactions.length,
     };
   }
 
   async getCustomerLedgerBalance(customerId: string): Promise<number> {
     const transactions = await this.getLedgerTransactionsByCustomer(customerId);
-    const totalIn = transactions.filter(t => t.type === 'in').reduce((sum, t) => sum + t.amount, 0);
-    const totalOut = transactions.filter(t => t.type === 'out').reduce((sum, t) => sum + t.amount, 0);
-    return totalIn - totalOut;
+    // Customer balance calculation - Khatabook style:
+    // "You Gave" (type=out) = Credit given = Customer owes you MORE
+    // "You Got" (type=in) = Payment received = Customer owes you LESS
+    // Balance = totalGave - totalGot = what customer owes you
+    // Positive = "You will GET", Negative = "You will GIVE"
+    // POS paid amounts (excludeFromBalance=true) are excluded
+    const balanceTransactions = transactions.filter(t => !t.excludeFromBalance);
+    const totalGave = balanceTransactions.filter(t => t.type === 'out').reduce((sum, t) => sum + t.amount, 0);
+    const totalGot = balanceTransactions.filter(t => t.type === 'in').reduce((sum, t) => sum + t.amount, 0);
+    return totalGave - totalGot;
   }
 
   async getRecurringLedgerTransactions(vendorId: string): Promise<LedgerTransaction[]> {
@@ -2881,6 +2981,60 @@ export class SupabaseStorage implements Partial<IStorage> {
   async deleteNotification(id: string): Promise<boolean> {
     const result = await db.delete(notifications).where(eq(notifications.id, id)).returning();
     return result.length > 0;
+  }
+
+  // ========== STOCK ALERTS ==========
+  async getStockAlertsByVendor(vendorId: string, filters?: { status?: string; alertType?: string }): Promise<StockAlert[]> {
+    let query = db.select().from(stockAlerts).where(eq(stockAlerts.vendorId, vendorId));
+    
+    if (filters?.status) {
+      query = query.where(eq(stockAlerts.status, filters.status)) as any;
+    }
+    if (filters?.alertType) {
+      query = query.where(eq(stockAlerts.alertType, filters.alertType)) as any;
+    }
+    
+    return await query.orderBy(desc(stockAlerts.createdAt));
+  }
+
+  async createStockAlert(alert: InsertStockAlert): Promise<StockAlert> {
+    const id = `alert-${nanoid()}`;
+    const result = await db.insert(stockAlerts).values({ 
+      ...alert, 
+      id, 
+      createdAt: new Date(),
+      itemType: alert.itemType || 'product',
+    }).returning();
+    return result[0];
+  }
+
+  async updateStockAlert(id: string, updates: Partial<StockAlert>): Promise<StockAlert | null> {
+    const result = await db.update(stockAlerts).set(updates).where(eq(stockAlerts.id, id)).returning();
+    return result[0] || null;
+  }
+
+  async acknowledgeStockAlert(id: string, userId: string): Promise<StockAlert | null> {
+    const result = await db.update(stockAlerts).set({ 
+      status: 'acknowledged', 
+      acknowledgedBy: userId, 
+      acknowledgedAt: new Date() 
+    }).where(eq(stockAlerts.id, id)).returning();
+    return result[0] || null;
+  }
+
+  async resolveStockAlert(id: string): Promise<StockAlert | null> {
+    const result = await db.update(stockAlerts).set({ 
+      status: 'resolved', 
+      resolvedAt: new Date() 
+    }).where(eq(stockAlerts.id, id)).returning();
+    return result[0] || null;
+  }
+
+  async dismissStockAlert(id: string): Promise<StockAlert | null> {
+    const result = await db.update(stockAlerts).set({ 
+      status: 'dismissed'
+    }).where(eq(stockAlerts.id, id)).returning();
+    return result[0] || null;
   }
 
   // ========== ORDER ITEMS ==========
