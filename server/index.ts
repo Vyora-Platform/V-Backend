@@ -6,6 +6,8 @@ import express, { type Request, Response, NextFunction } from "express";
 import cors from "cors";
 import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
+import { setupSwagger } from "./swagger";
+
 
 const app = express();
 
@@ -20,6 +22,9 @@ app.use(cors({
 // Increase body size limit to 50MB for handling image uploads and large forms
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: false, limit: '50mb' }));
+
+// Setup Swagger API documentation
+setupSwagger(app);
 
 app.use((req, res, next) => {
   const start = Date.now();
