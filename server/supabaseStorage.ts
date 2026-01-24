@@ -51,6 +51,7 @@ import {
   greetingTemplateUsage,
   vendorSubscriptions,
   subscriptionPlans,
+  demoRequests,
   type User,
   type InsertUser,
   type Vendor,
@@ -147,8 +148,13 @@ import {
   type InsertGreetingTemplate,
   type GreetingTemplateUsage,
   type InsertGreetingTemplateUsage,
+  type DemoRequest,
+  type InsertDemoRequest,
   type VendorSubscription,
   type InsertVendorSubscription,
+  passwordResetTokens,
+  type PasswordResetToken,
+  type InsertPasswordResetToken,
 } from "@shared/schema";
 import type { IStorage } from "./storage";
 import { nanoid } from "nanoid";
@@ -440,7 +446,9 @@ export class SupabaseStorage implements Partial<IStorage> {
   }
 
   async getMiniWebsiteBySubdomain(subdomain: string): Promise<MiniWebsite | undefined> {
-    const result = await db.select().from(miniWebsites).where(eq(miniWebsites.subdomain, subdomain)).limit(1);
+    // Case-insensitive subdomain lookup
+    const normalizedSubdomain = subdomain.toLowerCase();
+    const result = await db.select().from(miniWebsites).where(sql`LOWER(${miniWebsites.subdomain}) = ${normalizedSubdomain}`).limit(1);
     return result[0];
   }
 
@@ -1032,6 +1040,60 @@ export class SupabaseStorage implements Partial<IStorage> {
   async deleteExpense(id: string): Promise<boolean> {
     const result = await db.delete(expenses).where(eq(expenses.id, id)).returning();
     return result.length > 0;
+  }
+
+  async searchExpenses(vendorId: string, query: string): Promise<Expense[]> {
+    const loweredQuery = `%${query.toLowerCase()}%`;
+    return await db
+      .select()
+      .from(expenses)
+      .where(and(
+        eq(expenses.vendorId, vendorId),
+        or(
+          sql`LOWER(${expenses.title}) LIKE ${loweredQuery}`,
+          sql`LOWER(${expenses.category}) LIKE ${loweredQuery}`,
+          sql`LOWER(${expenses.paidTo}) LIKE ${loweredQuery}`,
+          sql`LOWER(${expenses.description}) LIKE ${loweredQuery}`
+        )
+      ))
+      .orderBy(desc(expenses.createdAt));
+  }
+
+  async getRecurringExpenses(vendorId: string): Promise<Expense[]> {
+    return await db
+      .select()
+      .from(expenses)
+      .where(and(
+        eq(expenses.vendorId, vendorId),
+        eq(expenses.isRecurring, true)
+      ))
+      .orderBy(desc(expenses.expenseDate));
+  }
+
+  async getUpcomingRecurringExpenses(vendorId: string, daysAhead: number = 30): Promise<Expense[]> {
+    const now = new Date();
+    const futureDate = new Date();
+    futureDate.setDate(futureDate.getDate() + daysAhead);
+
+    return await db
+      .select()
+      .from(expenses)
+      .where(and(
+        eq(expenses.vendorId, vendorId),
+        eq(expenses.isRecurring, true),
+        sql`${expenses.nextDueDate} IS NOT NULL`,
+        sql`${expenses.nextDueDate} >= ${now}`,
+        sql`${expenses.nextDueDate} <= ${futureDate}`
+      ))
+      .orderBy(expenses.nextDueDate);
+  }
+
+  async getExpensesBySupplier(supplierId: string): Promise<Expense[]> {
+    return await db
+      .select()
+      .from(expenses)
+      .where(eq(expenses.supplierId, supplierId))
+      .orderBy(desc(expenses.expenseDate));
   }
 
   // ========== ORDERS ==========
@@ -2431,6 +2493,30 @@ export class SupabaseStorage implements Partial<IStorage> {
     return { movement: movement[0], newStock };
   }
 
+  async getStockMovementsByVendor(vendorId: string, filters?: { productId?: string; movementType?: string; startDate?: Date; endDate?: Date }): Promise<StockMovement[]> {
+    const conditions = [eq(stockMovements.vendorId, vendorId)];
+    
+    if (filters?.productId) conditions.push(eq(stockMovements.vendorProductId, filters.productId));
+    if (filters?.movementType) conditions.push(eq(stockMovements.movementType, filters.movementType));
+    
+    const results = await db.select().from(stockMovements).where(and(...conditions)).orderBy(desc(stockMovements.createdAt));
+    
+    // Apply date filters in memory if provided
+    let movements = results;
+    if (filters?.startDate) {
+      movements = movements.filter(m => new Date(m.createdAt) >= filters.startDate!);
+    }
+    if (filters?.endDate) {
+      movements = movements.filter(m => new Date(m.createdAt) <= filters.endDate!);
+    }
+    
+    return movements;
+  }
+
+  async getStockMovementsByProduct(vendorProductId: string): Promise<StockMovement[]> {
+    return await db.select().from(stockMovements).where(eq(stockMovements.vendorProductId, vendorProductId)).orderBy(desc(stockMovements.createdAt));
+  }
+
   // ========== LEDGER & TRANSACTIONS ==========
   async getLedgerTransaction(id: string): Promise<LedgerTransaction | undefined> {
     const result = await db.select().from(ledgerTransactions).where(eq(ledgerTransactions.id, id)).limit(1);
@@ -2931,6 +3017,92 @@ export class SupabaseStorage implements Partial<IStorage> {
     return result[0];
   }
 
+  // ========== DEMO REQUESTS ==========
+  async getDemoRequest(id: string): Promise<DemoRequest | undefined> {
+    try {
+      const result = await db.select().from(demoRequests).where(eq(demoRequests.id, id)).limit(1);
+      return result[0];
+    } catch (error) {
+      console.error('[DATABASE] Error fetching demo request:', error);
+      return undefined;
+    }
+  }
+
+  async getAllDemoRequests(filters?: { status?: string }): Promise<DemoRequest[]> {
+    try {
+      console.log('[DATABASE] Fetching demo requests with filters:', filters);
+      let query = db.select().from(demoRequests);
+      
+      const conditions: any[] = [];
+      if (filters?.status) {
+        conditions.push(eq(demoRequests.status, filters.status));
+      }
+      
+      if (conditions.length > 0) {
+        query = query.where(and(...conditions)) as any;
+      }
+      
+      const results = await query.orderBy(desc(demoRequests.createdAt));
+      console.log(`[DATABASE] Found ${results.length} demo requests`);
+      return results;
+    } catch (error) {
+      console.error('[DATABASE] Error fetching demo requests:', error);
+      return [];
+    }
+  }
+
+  async createDemoRequest(insertData: InsertDemoRequest): Promise<DemoRequest> {
+    console.log('[DATABASE] Creating demo request:', insertData.name, insertData.phone);
+    const id = `demo-${nanoid()}`;
+    const now = new Date();
+    
+    const newRequest: typeof demoRequests.$inferInsert = {
+      id,
+      name: insertData.name,
+      phone: insertData.phone,
+      email: insertData.email || null,
+      businessName: insertData.businessName || null,
+      source: insertData.source || "landing_page",
+      status: insertData.status || "new",
+      notes: insertData.notes || null,
+      scheduledAt: insertData.scheduledAt || null,
+      completedAt: insertData.completedAt || null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    
+    const result = await db.insert(demoRequests).values(newRequest).returning();
+    console.log('[DATABASE] Demo request created:', result[0]?.id);
+    return result[0];
+  }
+
+  async updateDemoRequest(id: string, updates: Partial<InsertDemoRequest>): Promise<DemoRequest | undefined> {
+    try {
+      console.log('[DATABASE] Updating demo request:', id);
+      const result = await db
+        .update(demoRequests)
+        .set({ ...updates, updatedAt: new Date() })
+        .where(eq(demoRequests.id, id))
+        .returning();
+      
+      return result[0];
+    } catch (error) {
+      console.error('[DATABASE] Error updating demo request:', error);
+      return undefined;
+    }
+  }
+
+  async deleteDemoRequest(id: string): Promise<boolean> {
+    try {
+      console.log('[DATABASE] Deleting demo request:', id);
+      await db.delete(demoRequests).where(eq(demoRequests.id, id));
+      return true;
+    } catch (error) {
+      console.error('[DATABASE] Error deleting demo request:', error);
+      return false;
+    }
+  }
+
   // ========== GREETING TEMPLATES ==========
   async getGreetingTemplate(id: string): Promise<GreetingTemplate | undefined> {
     const result = await db.select().from(greetingTemplates).where(eq(greetingTemplates.id, id)).limit(1);
@@ -2944,61 +3116,67 @@ export class SupabaseStorage implements Partial<IStorage> {
     industries?: string[];
     isTrending?: boolean;
   }): Promise<GreetingTemplate[]> {
-    console.log('📝 [SupabaseStorage] getAllGreetingTemplates called with filters:', filters);
+    try {
+      console.log('📝 [SupabaseStorage] getAllGreetingTemplates called with filters:', filters);
 
-    let query = db.select().from(greetingTemplates);
+      let query = db.select().from(greetingTemplates);
 
-    // Fetch all templates from database
-    const allTemplates = await query;
-    console.log(`📝 [SupabaseStorage] Fetched ${allTemplates.length} templates from database`);
+      // Fetch all templates from database
+      const allTemplates = await query;
+      console.log(`📝 [SupabaseStorage] Fetched ${allTemplates.length} templates from database`);
 
-    // Apply in-memory filtering for complex array operations
-    let filteredTemplates = allTemplates;
+      // Apply in-memory filtering for complex array operations
+      let filteredTemplates = allTemplates;
 
-    if (filters?.status) {
-      filteredTemplates = filteredTemplates.filter(t => t.status === filters.status);
+      if (filters?.status) {
+        filteredTemplates = filteredTemplates.filter(t => t.status === filters.status);
+      }
+
+      if (filters?.isTrending !== undefined) {
+        filteredTemplates = filteredTemplates.filter(t => t.isTrending === filters.isTrending);
+      }
+
+      // Array overlap filters
+      if (filters?.occasions && filters.occasions.length > 0) {
+        filteredTemplates = filteredTemplates.filter(t => 
+          t.occasions.some(o => filters.occasions!.includes(o))
+        );
+      }
+
+      if (filters?.offerTypes && filters.offerTypes.length > 0) {
+        filteredTemplates = filteredTemplates.filter(t => 
+          t.offerTypes.some(o => filters.offerTypes!.includes(o))
+        );
+      }
+
+      if (filters?.industries && filters.industries.length > 0) {
+        filteredTemplates = filteredTemplates.filter(t => 
+          t.industries.some(i => filters.industries!.includes(i))
+        );
+      }
+
+      // Sort by: 1) Trending first, 2) Newest first (createdAt), 3) Download count
+      filteredTemplates.sort((a, b) => {
+        // Trending templates come first
+        if (a.isTrending && !b.isTrending) return -1;
+        if (!a.isTrending && b.isTrending) return 1;
+        
+        // Then sort by creation date (newest first)
+        const dateA = new Date(a.createdAt).getTime();
+        const dateB = new Date(b.createdAt).getTime();
+        if (dateB !== dateA) return dateB - dateA;
+        
+        // Finally by download count
+        return b.downloadCount - a.downloadCount;
+      });
+
+      console.log(`📝 [SupabaseStorage] Returning ${filteredTemplates.length} filtered templates`);
+      return filteredTemplates;
+    } catch (error) {
+      console.error('❌ [SupabaseStorage] Error fetching greeting templates:', error);
+      // Return empty array instead of throwing to prevent 500 errors
+      return [];
     }
-
-    if (filters?.isTrending !== undefined) {
-      filteredTemplates = filteredTemplates.filter(t => t.isTrending === filters.isTrending);
-    }
-
-    // Array overlap filters
-    if (filters?.occasions && filters.occasions.length > 0) {
-      filteredTemplates = filteredTemplates.filter(t => 
-        t.occasions.some(o => filters.occasions!.includes(o))
-      );
-    }
-
-    if (filters?.offerTypes && filters.offerTypes.length > 0) {
-      filteredTemplates = filteredTemplates.filter(t => 
-        t.offerTypes.some(o => filters.offerTypes!.includes(o))
-      );
-    }
-
-    if (filters?.industries && filters.industries.length > 0) {
-      filteredTemplates = filteredTemplates.filter(t => 
-        t.industries.some(i => filters.industries!.includes(i))
-      );
-    }
-
-    // Sort by: 1) Trending first, 2) Newest first (createdAt), 3) Download count
-    filteredTemplates.sort((a, b) => {
-      // Trending templates come first
-      if (a.isTrending && !b.isTrending) return -1;
-      if (!a.isTrending && b.isTrending) return 1;
-      
-      // Then sort by creation date (newest first)
-      const dateA = new Date(a.createdAt).getTime();
-      const dateB = new Date(b.createdAt).getTime();
-      if (dateB !== dateA) return dateB - dateA;
-      
-      // Finally by download count
-      return b.downloadCount - a.downloadCount;
-    });
-
-    console.log(`📝 [SupabaseStorage] Returning ${filteredTemplates.length} filtered templates`);
-    return filteredTemplates;
   }
 
   async searchGreetingTemplates(query: string, filters?: {
@@ -3038,20 +3216,25 @@ export class SupabaseStorage implements Partial<IStorage> {
   }
 
   async createGreetingTemplate(template: InsertGreetingTemplate): Promise<GreetingTemplate> {
-    console.log('📝 [SupabaseStorage] createGreetingTemplate called');
-    const id = `gt-${nanoid()}`;
-    const now = new Date();
-    
-    const newTemplate: typeof greetingTemplates.$inferInsert = {
-      ...template,
-      id,
-      createdAt: now,
-      updatedAt: now,
-    };
+    try {
+      console.log('📝 [SupabaseStorage] createGreetingTemplate called');
+      const id = `gt-${nanoid()}`;
+      const now = new Date();
+      
+      const newTemplate: typeof greetingTemplates.$inferInsert = {
+        ...template,
+        id,
+        createdAt: now,
+        updatedAt: now,
+      };
 
-    const result = await db.insert(greetingTemplates).values(newTemplate).returning();
-    console.log('✅ [SupabaseStorage] Greeting template created:', result[0]?.id);
-    return result[0];
+      const result = await db.insert(greetingTemplates).values(newTemplate).returning();
+      console.log('✅ [SupabaseStorage] Greeting template created:', result[0]?.id);
+      return result[0];
+    } catch (error) {
+      console.error('❌ [SupabaseStorage] Error creating greeting template:', error);
+      throw error;
+    }
   }
 
   async updateGreetingTemplate(id: string, updates: Partial<InsertGreetingTemplate>): Promise<GreetingTemplate | undefined> {
@@ -3459,6 +3642,105 @@ export class SupabaseStorage implements Partial<IStorage> {
     } catch (error: any) {
       console.error('[DATABASE ERROR] Failed to cancel vendor subscription:', error);
       throw error;
+    }
+  }
+
+  // ========== PASSWORD RESET TOKENS ==========
+
+  async createPasswordResetToken(data: InsertPasswordResetToken): Promise<PasswordResetToken> {
+    try {
+      // First, invalidate any existing tokens for this email
+      await db
+        .update(passwordResetTokens)
+        .set({ used: true })
+        .where(and(
+          eq(passwordResetTokens.email, data.email.toLowerCase()),
+          eq(passwordResetTokens.used, false)
+        ));
+
+      // Create new token
+      const result = await db
+        .insert(passwordResetTokens)
+        .values({
+          ...data,
+          email: data.email.toLowerCase(),
+        })
+        .returning();
+      console.log('[DATABASE] Created password reset token for:', data.email);
+      return result[0];
+    } catch (error: any) {
+      console.error('[DATABASE ERROR] Failed to create password reset token:', error);
+      throw error;
+    }
+  }
+
+  async getPasswordResetToken(email: string, otp: string): Promise<PasswordResetToken | undefined> {
+    try {
+      const result = await db
+        .select()
+        .from(passwordResetTokens)
+        .where(and(
+          eq(passwordResetTokens.email, email.toLowerCase()),
+          eq(passwordResetTokens.otp, otp),
+          eq(passwordResetTokens.used, false)
+        ))
+        .orderBy(desc(passwordResetTokens.createdAt))
+        .limit(1);
+      return result[0];
+    } catch (error: any) {
+      console.error('[DATABASE ERROR] Failed to get password reset token:', error);
+      throw error;
+    }
+  }
+
+  async verifyPasswordResetToken(email: string, otp: string): Promise<PasswordResetToken | undefined> {
+    try {
+      const result = await db
+        .update(passwordResetTokens)
+        .set({ verified: true })
+        .where(and(
+          eq(passwordResetTokens.email, email.toLowerCase()),
+          eq(passwordResetTokens.otp, otp),
+          eq(passwordResetTokens.used, false)
+        ))
+        .returning();
+      return result[0];
+    } catch (error: any) {
+      console.error('[DATABASE ERROR] Failed to verify password reset token:', error);
+      throw error;
+    }
+  }
+
+  async markPasswordResetTokenUsed(email: string, otp: string): Promise<boolean> {
+    try {
+      const result = await db
+        .update(passwordResetTokens)
+        .set({ used: true })
+        .where(and(
+          eq(passwordResetTokens.email, email.toLowerCase()),
+          eq(passwordResetTokens.otp, otp)
+        ))
+        .returning();
+      return result.length > 0;
+    } catch (error: any) {
+      console.error('[DATABASE ERROR] Failed to mark password reset token as used:', error);
+      throw error;
+    }
+  }
+
+  async cleanupExpiredTokens(): Promise<number> {
+    try {
+      const result = await db
+        .delete(passwordResetTokens)
+        .where(lte(passwordResetTokens.expiresAt, new Date()))
+        .returning();
+      if (result.length > 0) {
+        console.log('[DATABASE] Cleaned up', result.length, 'expired password reset tokens');
+      }
+      return result.length;
+    } catch (error: any) {
+      console.error('[DATABASE ERROR] Failed to cleanup expired tokens:', error);
+      return 0;
     }
   }
 }

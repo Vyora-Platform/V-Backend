@@ -1147,6 +1147,39 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Get vendor stats for a specific vendor (Admin)
+  app.get("/api/admin/vendors/:vendorId/stats", async (req, res) => {
+    try {
+      const { vendorId } = req.params;
+      console.log('[ADMIN] Fetching stats for vendor:', vendorId);
+      
+      // Fetch all counts in parallel
+      const [products, services, leads, customers, suppliers, orders] = await Promise.all([
+        storage.getVendorProductsByVendor ? storage.getVendorProductsByVendor(vendorId) : [],
+        storage.getVendorCataloguesByVendor ? storage.getVendorCataloguesByVendor(vendorId) : [],
+        storage.getLeadsByVendor ? storage.getLeadsByVendor(vendorId) : [],
+        storage.getCustomersByVendor ? storage.getCustomersByVendor(vendorId) : [],
+        storage.getSuppliersByVendor ? storage.getSuppliersByVendor(vendorId) : [],
+        storage.getOrdersByVendor ? storage.getOrdersByVendor(vendorId) : [],
+      ]);
+
+      const stats = {
+        productsCount: (products as any[]).length,
+        servicesCount: (services as any[]).length,
+        leadsCount: (leads as any[]).length,
+        customersCount: (customers as any[]).length,
+        suppliersCount: (suppliers as any[]).length,
+        ordersCount: (orders as any[]).length,
+      };
+
+      console.log('[ADMIN] Vendor stats:', stats);
+      res.json(stats);
+    } catch (error: any) {
+      console.error("[ADMIN] Error fetching vendor stats:", error);
+      res.status(500).json({ error: "Failed to fetch vendor stats" });
+    }
+  });
+
   // Get single vendor
   app.get("/api/vendors/:id", async (req, res) => {
     try {
@@ -2135,28 +2168,35 @@ export async function registerRoutes(app: Express): Promise<Server> {
     try {
       console.log("[TASK] Creating task with body:", JSON.stringify(req.body, null, 2));
       
-      const validatedData = insertTaskSchema.parse({
-        ...req.body,
-        vendorId: req.params.vendorId,
-      });
+      const vendorId = req.params.vendorId;
       
-      // Verify the createdBy user exists before inserting
-      if (validatedData.createdBy) {
+      // Build task data with vendorId as default createdBy if not provided
+      const taskData = {
+        ...req.body,
+        vendorId,
+        // Use vendorId as createdBy if not provided (since vendor is creating the task)
+        createdBy: req.body.createdBy || vendorId,
+      };
+      
+      // If assignedTo is empty string, set to null
+      if (taskData.assignedTo === "") {
+        taskData.assignedTo = null;
+      }
+      
+      const validatedData = insertTaskSchema.parse(taskData);
+      
+      // Verify the createdBy user/vendor exists before inserting
+      if (validatedData.createdBy && validatedData.createdBy !== vendorId) {
         try {
           const userExists = await storage.getUser(validatedData.createdBy);
           if (!userExists) {
             console.warn('[TASK] User not found for createdBy:', validatedData.createdBy);
-            return res.status(400).json({ 
-              error: "Invalid task data", 
-              details: "The specified user does not exist. Please ensure you are logged in." 
-            });
+            // Fallback to vendorId if user doesn't exist
+            (validatedData as any).createdBy = vendorId;
           }
         } catch (userCheckError) {
           console.error('[TASK] Error checking user:', userCheckError);
-          return res.status(400).json({ 
-            error: "Invalid task data", 
-            details: "Unable to verify user. Please try again." 
-          });
+          (validatedData as any).createdBy = vendorId;
         }
       }
       
@@ -2166,10 +2206,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
           const employeeExists = await storage.getEmployee(validatedData.assignedTo);
           if (!employeeExists) {
             console.warn('[TASK] Employee not found for assignedTo:', validatedData.assignedTo);
-            return res.status(400).json({ 
-              error: "Invalid task data", 
-              details: "The specified employee does not exist." 
-            });
+            (validatedData as any).assignedTo = null;
           }
         } catch (employeeCheckError) {
           console.error('[TASK] Error checking employee:', employeeCheckError);
@@ -2683,18 +2720,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // ====================
-  // TASKS
+  // TASKS (Additional Routes)
   // ====================
-
-  // Get all tasks for a vendor
-  app.get("/api/vendors/:vendorId/tasks", async (req, res) => {
-    try {
-      const tasks = await storage.getTasksByVendor(req.params.vendorId);
-      res.json(tasks);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch tasks" });
-    }
-  });
 
   // Get tasks for an employee
   app.get("/api/employees/:employeeId/tasks", async (req, res) => {
@@ -2706,7 +2733,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Get single task
+  // Get single task by ID
   app.get("/api/tasks/:id", async (req, res) => {
     try {
       const task = await storage.getTask(req.params.id);
@@ -2716,73 +2743,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       res.json(task);
     } catch (error) {
       res.status(500).json({ error: "Failed to fetch task" });
-    }
-  });
-
-  // Create task (duplicate route - should be consolidated)
-  app.post("/api/vendors/:vendorId/tasks", async (req, res) => {
-    try {
-      const validatedData = insertTaskSchema.parse({
-        ...req.body,
-        vendorId: req.params.vendorId,
-      });
-      
-      // Verify user exists
-      if (validatedData.createdBy) {
-        const userExists = await storage.getUser(validatedData.createdBy);
-        if (!userExists) {
-          return res.status(400).json({ 
-            error: "Invalid task data", 
-            details: "The specified user does not exist." 
-          });
-        }
-      }
-      
-      // Verify employee exists if assigned
-      if (validatedData.assignedTo) {
-        const employeeExists = await storage.getEmployee(validatedData.assignedTo);
-        if (!employeeExists) {
-          return res.status(400).json({ 
-            error: "Invalid task data", 
-            details: "The specified employee does not exist." 
-          });
-        }
-      }
-      
-      const task = await storage.createTask(validatedData);
-      res.status(201).json(task);
-    } catch (error: any) {
-      let errorDetails = error instanceof Error ? error.message : String(error);
-      if (error.code === '23503' || errorDetails.includes('foreign key constraint')) {
-        errorDetails = "Invalid user, employee, or vendor reference.";
-      }
-      res.status(400).json({ error: "Invalid task data", details: errorDetails });
-    }
-  });
-
-  // Update task
-  app.patch("/api/tasks/:id", async (req, res) => {
-    try {
-      const task = await storage.updateTask(req.params.id, req.body);
-      if (!task) {
-        return res.status(404).json({ error: "Task not found" });
-      }
-      res.json(task);
-    } catch (error) {
-      res.status(400).json({ error: "Failed to update task" });
-    }
-  });
-
-  // Delete task
-  app.delete("/api/tasks/:id", async (req, res) => {
-    try {
-      const deleted = await storage.deleteTask(req.params.id);
-      if (!deleted) {
-        return res.status(404).json({ error: "Task not found" });
-      }
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ error: "Failed to delete task" });
     }
   });
 
@@ -4209,6 +4169,42 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ========== FILE UPLOAD ROUTES ==========
   
   const { createUploadMiddleware, createUploadRoute, genericUploadHandler, handleFileUpload } = await import("./uploads");
+
+  // Public image upload handler - uploads to public-assets bucket with no signature required
+  app.post("/api/upload/public", createUploadMiddleware(), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+      
+      // Get vendorId and category from form data
+      const vendorId = req.body.vendorId as string || req.query.vendorId as string || "vendor-1";
+      const category = req.body.category as string || "products";
+      
+      // Validate vendorId format to prevent path traversal
+      if (!/^[a-zA-Z0-9_-]+$/.test(vendorId)) {
+        return res.status(400).json({ error: "Invalid vendor identifier" });
+      }
+      
+      // Only allow public categories
+      const validPublicCategories = ["logo", "hero", "banner", "gallery", "products", "services"];
+      if (!validPublicCategories.includes(category)) {
+        return res.status(400).json({ error: "Invalid upload category for public uploads" });
+      }
+      
+      const result = await handleFileUpload(req.file, {
+        vendorId,
+        category,
+        isPrivate: false, // Always public for this endpoint
+      });
+      
+      res.json(result);
+    } catch (error) {
+      console.error("Public file upload error:", error);
+      const message = error instanceof Error ? error.message : "Failed to upload file";
+      res.status(400).json({ error: message });
+    }
+  });
   
   // Generic file upload handler for mini-website assets
   app.post("/api/upload/:category", createUploadMiddleware(), async (req, res) => {
@@ -4265,7 +4261,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const result = await handleFileUpload(req.file, {
         vendorId,
         category: "ledger-attachments",
-        isPrivate: true,
+        isPrivate: false, // Changed to false so images are publicly accessible
         maxSize: 20 * 1024 * 1024, // 20MB for documents
         allowedMimeTypes: ["image/jpeg", "image/png", "image/webp", "image/gif", "application/pdf"],
         allowedExtensions: [".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf"],
@@ -4453,12 +4449,58 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       console.log("[PUBLIC API] Fetching services for vendor:", miniWebsite.vendorId);
       // Get vendor services/products from catalog
-      const services = await storage.getVendorCataloguesByVendor(miniWebsite.vendorId);
+      const allServices = await storage.getVendorCataloguesByVendor(miniWebsite.vendorId);
       console.log("[PUBLIC API] Fetching products for vendor:", miniWebsite.vendorId);
-      const products = await storage.getVendorProductsByVendor(miniWebsite.vendorId);
+      const allProducts = await storage.getVendorProductsByVendor(miniWebsite.vendorId);
+      
+      // Filter services and products by selected IDs from the website configuration
+      const selectedCatalog = (miniWebsite as any).selectedCatalog || {};
+      const selectedServiceIds = selectedCatalog.services || [];
+      const selectedProductIds = selectedCatalog.products || [];
+      
+      // Filter only active items first
+      const activeServices = allServices.filter((s: any) => s.isActive !== false);
+      const activeProducts = allProducts.filter((p: any) => p.isActive !== false);
+      
+      // If specific items are selected, filter; otherwise show all active items
+      const services = selectedServiceIds.length > 0 
+        ? activeServices.filter((s: any) => selectedServiceIds.includes(s.id))
+        : activeServices;
+      const products = selectedProductIds.length > 0 
+        ? activeProducts.filter((p: any) => selectedProductIds.includes(p.id))
+        : activeProducts;
+      
+      console.log("[PUBLIC API] Filtered to", services.length, "services and", products.length, "products");
+      
+      // Fetch coupons for the vendor and filter by selectedCouponIds
+      console.log("[PUBLIC API] Fetching coupons for vendor:", miniWebsite.vendorId);
+      let coupons: any[] = [];
+      try {
+        const allCoupons = await storage.getCouponsByVendor(miniWebsite.vendorId);
+        const selectedCouponIds = (miniWebsite as any).selectedCouponIds || [];
+        
+        // If selectedCouponIds exists, filter to only selected coupons; otherwise use all active coupons
+        if (selectedCouponIds.length > 0) {
+          coupons = allCoupons.filter((c: any) => 
+            selectedCouponIds.includes(c.id) && 
+            c.status === 'active' && 
+            (!c.expiryDate || new Date(c.expiryDate) > new Date())
+          );
+        } else {
+          // Fallback: show all active coupons if no specific selection
+          coupons = allCoupons.filter((c: any) => 
+            c.status === 'active' && 
+            (!c.expiryDate || new Date(c.expiryDate) > new Date())
+          );
+        }
+        console.log("[PUBLIC API] Found", coupons.length, "active coupons");
+      } catch (err) {
+        console.error("[PUBLIC API] Error fetching coupons:", err);
+        coupons = [];
+      }
       
       console.log("[PUBLIC API] Returning mini-website data");
-      res.json({ ...miniWebsite, reviews, services, products });
+      res.json({ ...miniWebsite, reviews, services, products, coupons });
     } catch (error) {
       console.error("[PUBLIC API] Error fetching mini-website:", error);
       res.status(500).json({ error: "Failed to fetch mini-website" });
@@ -4520,17 +4562,123 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(404).json({ error: "Mini-website not found" });
       }
 
-      const { insertMiniWebsiteLeadSchema } = await import("@shared/schema");
-      const data = { 
+      const { name, email, phone, message } = req.body;
+
+      // Check if customer is authenticated
+      let authenticatedCustomerId: string | null = null;
+      if (req.headers.authorization?.startsWith('Bearer ')) {
+        try {
+          const token = req.headers.authorization.substring(7);
+          const { verifyToken } = await import('./auth');
+          const decoded = verifyToken(token) as any;
+          if (decoded?.role === 'customer' && decoded?.customerId) {
+            authenticatedCustomerId = decoded.customerId;
+            console.log('✅ [Lead] Authenticated customer:', authenticatedCustomerId);
+          }
+        } catch {
+          // Not authenticated, proceed as guest
+          console.log('📝 [Lead] Guest submission (no valid token)');
+        }
+      }
+
+      let customerId = authenticatedCustomerId;
+
+      // For guest customers, check if exists by phone or create new
+      if (!customerId && phone) {
+        const customers = await storage.getCustomersByVendor(miniWebsite.vendorId);
+        let existingCustomer = customers.find(c => c.phone === phone);
+
+        if (!existingCustomer && email) {
+          existingCustomer = customers.find(c => c.email === email);
+        }
+
+        if (existingCustomer) {
+          customerId = existingCustomer.id;
+          console.log('✅ [Lead] Found existing customer by phone/email:', customerId);
+        } else {
+          // Create a new guest customer
+          const newCustomerId = `cust-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+          const newCustomer = await storage.createCustomer({
+            id: newCustomerId,
+            vendorId: miniWebsite.vendorId,
+            name: name || 'Guest Customer',
+            phone: phone || '',
+            email: email || null,
+            source: 'website',
+            leadStatus: 'new',
+            createdAt: new Date(),
+          });
+          customerId = newCustomer.id;
+          console.log('✅ [Lead] Created new guest customer:', customerId);
+        }
+      }
+
+      // 1. Create main Lead in leads table (visible in vendor leads section)
+      const { insertLeadSchema, insertMiniWebsiteLeadSchema } = await import("@shared/schema");
+      
+      const mainLeadId = `lead-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      const mainLeadData = {
+        id: mainLeadId,
+        vendorId: miniWebsite.vendorId,
+        name: name || 'Guest',
+        phone: phone || '',
+        email: email || null,
+        source: 'website' as const,
+        sourceDetails: `Website enquiry from ${miniWebsite.subdomain}`,
+        status: 'new' as const,
+        interestType: 'unknown' as const,
+        interestDescription: message || '',
+        priority: 'medium' as const,
+        notes: message || '',
+        convertedToCustomerId: customerId || null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      
+      let mainLead;
+      try {
+        mainLead = await storage.createLead(mainLeadData);
+        console.log('✅ [Lead] Created main lead:', mainLead.id);
+      } catch (mainLeadError) {
+        console.error('⚠️ [Lead] Failed to create main lead:', mainLeadError);
+        // Continue even if main lead creation fails
+      }
+      
+      // 2. Create MiniWebsiteLead (for mini-website specific tracking)
+      const miniWebsiteLeadData = { 
         ...req.body, 
         miniWebsiteId: miniWebsite.id,
         vendorId: miniWebsite.vendorId,
+        source: 'website',
+        convertedToLeadId: mainLead?.id || null,
       };
-      const validatedData = insertMiniWebsiteLeadSchema.parse(data);
+      const validatedData = insertMiniWebsiteLeadSchema.parse(miniWebsiteLeadData);
 
-      const lead = await storage.createMiniWebsiteLead(validatedData);
-      res.status(201).json(lead);
+      const miniWebsiteLead = await storage.createMiniWebsiteLead(validatedData);
+
+      // 3. Create notification for vendor
+      try {
+        const notificationId = `notif-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        await storage.createNotification({
+          id: notificationId,
+          userId: miniWebsite.vendorId,
+          vendorId: miniWebsite.vendorId,
+          type: "lead",
+          title: `New Enquiry from Website`,
+          message: `New enquiry from ${name} (${phone}) via ${miniWebsite.subdomain}.vendorhub.com: "${message?.substring(0, 100) || 'No message'}"`,
+          link: `/vendor/leads`, // Direct link to leads page
+          createdAt: new Date(),
+          read: false,
+        });
+        console.log('✅ [Lead] Notification created for vendor');
+      } catch (notifError) {
+        console.error('⚠️ [Lead] Failed to create notification:', notifError);
+        // Don't fail the request if notification fails
+      }
+
+      res.status(201).json({ ...miniWebsiteLead, customerId, leadId: mainLead?.id });
     } catch (error) {
+      console.error('❌ [Lead] Error:', error);
       res.status(400).json({ error: "Failed to submit lead" });
     }
   });
@@ -4918,18 +5066,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Send notification to vendor
       // NOTE: For mini website quotations, userId = customerId (from customers table)
       // This allows vendors to track which customer requested the quote
+      // Use existingCustomer.id which is always available (for both authenticated and guest customers)
+      const customerIdForNotification = existingCustomer.id;
       console.log('📧 [Notification] Creating notification for vendor:', miniWebsite.vendorId);
-      console.log('📧 [Notification] userId (customerId):', authenticatedCustomerId);
-      console.log('📧 [Notification] Customer name:', customer.name);
+      console.log('📧 [Notification] userId (customerId):', customerIdForNotification);
+      console.log('📧 [Notification] Customer name:', existingCustomer.name);
       
       const notificationId = `notif-${nanoid()}`;
+      const isGuest = !authenticatedCustomerId;
       await storage.createNotification({
         id: notificationId,
-        userId: authenticatedCustomerId, // userId = customerId for mini website quotations
+        userId: customerIdForNotification, // userId = customerId for mini website quotations (works for both authenticated and guest)
         vendorId: miniWebsite.vendorId,
         type: "quotation",
-        title: "New Quotation Request from Registered Customer",
-        message: `New quotation request ${createdQuotation.quotationNumber} received from ${customer.name} (${customer.phone}) via ${miniWebsite.subdomain}.vendorhub.com`,
+        title: isGuest ? "New Quotation Request from Guest" : "New Quotation Request from Registered Customer",
+        message: `New quotation request ${createdQuotation.quotationNumber} received from ${existingCustomer.name} (${existingCustomer.phone}) via ${miniWebsite.subdomain}.vendorhub.com`,
+        link: `/vendor/quotations?tab=requests`, // Direct link to quotation requests
         createdAt: new Date(),
         read: false,
       });
@@ -5181,6 +5333,247 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error: any) {
       console.error("Get customer profile error:", error);
       res.status(401).json({ error: "Failed to get profile", message: error.message });
+    }
+  });
+
+  // ========== CUSTOMER FORGOT PASSWORD ENDPOINTS ==========
+  
+  // Request password reset OTP for customer (requires vendorId + email)
+  app.post("/api/mini-website/:subdomain/customer/forgot-password", async (req, res) => {
+    try {
+      const { email, vendorId: inputVendorId } = req.body;
+      const { subdomain } = req.params;
+
+      if (!email) {
+        return res.status(400).json({ error: 'Email is required' });
+      }
+
+      const normalizedEmail = email.toLowerCase();
+
+      // Get mini-website
+      const miniWebsite = await storage.getMiniWebsiteBySubdomain(subdomain);
+      if (!miniWebsite) {
+        return res.status(404).json({ error: "Website not found" });
+      }
+
+      // Use input vendorId if provided, otherwise use from miniWebsite
+      const vendorId = inputVendorId || miniWebsite.vendorId;
+
+      // Validate vendorId matches the website's vendor
+      if (inputVendorId && inputVendorId !== miniWebsite.vendorId) {
+        console.log(`[Customer Auth] VendorId mismatch: input=${inputVendorId}, website=${miniWebsite.vendorId}`);
+        return res.status(400).json({ error: 'Invalid vendor' });
+      }
+
+      // Check if customer exists for this vendor
+      const customers = await storage.getCustomersByVendor(vendorId);
+      const customer = customers.find(c => c.email?.toLowerCase() === normalizedEmail);
+
+      if (!customer) {
+        // Don't reveal if email exists for security, but still return success
+        console.log(`[Customer Auth] No customer found for ${normalizedEmail} with vendor ${vendorId}`);
+        return res.json({ 
+          success: true, 
+          message: 'If an account exists with this email, you will receive an OTP shortly.',
+          vendorId: vendorId,
+          email: normalizedEmail
+        });
+      }
+
+      // Check if user exists
+      const user = await storage.getUserByEmail(normalizedEmail);
+      if (!user) {
+        return res.json({ 
+          success: true, 
+          message: 'If an account exists with this email, you will receive an OTP shortly.',
+          vendorId: vendorId,
+          email: normalizedEmail
+        });
+      }
+
+      // Generate OTP
+      const { generateOTP, sendPasswordResetOTP } = await import('./emailService');
+      const otp = generateOTP();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+      // Store OTP in database with vendorId
+      const { supabaseStorage } = await import('./supabaseStorage');
+      await supabaseStorage.createPasswordResetToken({
+        email: normalizedEmail,
+        otp,
+        vendorId: vendorId, // Store vendorId for customer-specific reset
+        expiresAt,
+        verified: false,
+        used: false,
+      });
+
+      // Send OTP via email
+      const emailSent = await sendPasswordResetOTP(normalizedEmail, otp);
+
+      if (!emailSent) {
+        console.error(`[Customer Auth] Failed to send OTP email to ${normalizedEmail}`);
+        return res.status(500).json({ error: 'Failed to send OTP email. Please try again.' });
+      }
+
+      console.log(`✅ [Customer Auth] Password reset OTP sent to ${normalizedEmail} for vendor ${vendorId}`);
+
+      res.json({ 
+        success: true, 
+        message: 'OTP has been sent to your email address.',
+        vendorId: vendorId,
+        email: normalizedEmail
+      });
+    } catch (error: any) {
+      console.error("[Customer Auth] Forgot password error:", error);
+      res.status(500).json({ error: error.message || 'Failed to process password reset request' });
+    }
+  });
+
+  // Verify OTP for customer password reset (requires vendorId + email + otp)
+  app.post("/api/mini-website/:subdomain/customer/verify-otp", async (req, res) => {
+    try {
+      const { email, otp, vendorId: inputVendorId } = req.body;
+      const { subdomain } = req.params;
+
+      if (!email || !otp) {
+        return res.status(400).json({ error: 'Email and OTP are required' });
+      }
+
+      const normalizedEmail = email.toLowerCase();
+
+      // Get mini-website
+      const miniWebsite = await storage.getMiniWebsiteBySubdomain(subdomain);
+      if (!miniWebsite) {
+        return res.status(404).json({ error: "Website not found" });
+      }
+
+      // Use input vendorId if provided, otherwise use from miniWebsite
+      const vendorId = inputVendorId || miniWebsite.vendorId;
+
+      // Validate vendorId matches the website's vendor
+      if (inputVendorId && inputVendorId !== miniWebsite.vendorId) {
+        console.log(`[Customer Auth] VendorId mismatch: input=${inputVendorId}, website=${miniWebsite.vendorId}`);
+        return res.status(400).json({ error: 'Invalid vendor' });
+      }
+
+      // Get token from database with vendorId check
+      const { supabaseStorage } = await import('./supabaseStorage');
+      const token = await supabaseStorage.getPasswordResetToken(normalizedEmail, otp);
+
+      if (!token) {
+        return res.status(400).json({ error: 'Invalid OTP. Please try again.' });
+      }
+
+      // Check if this token is for the correct vendor (if vendorId is set)
+      if (token.vendorId && token.vendorId !== vendorId) {
+        return res.status(400).json({ error: 'Invalid OTP for this website.' });
+      }
+
+      // Check if OTP has expired
+      if (new Date() > new Date(token.expiresAt)) {
+        await supabaseStorage.markPasswordResetTokenUsed(normalizedEmail, otp);
+        return res.status(400).json({ error: 'OTP has expired. Please request a new OTP.' });
+      }
+
+      // Mark OTP as verified
+      await supabaseStorage.verifyPasswordResetToken(normalizedEmail, otp);
+
+      console.log(`✅ [Customer Auth] OTP verified for ${normalizedEmail} with vendor ${vendorId}`);
+
+      res.json({ 
+        success: true, 
+        message: 'OTP verified successfully. You can now reset your password.',
+        vendorId: vendorId,
+        email: normalizedEmail
+      });
+    } catch (error: any) {
+      console.error("[Customer Auth] OTP verification error:", error);
+      res.status(500).json({ error: error.message || 'Failed to verify OTP' });
+    }
+  });
+
+  // Reset customer password with verified OTP (requires vendorId + email + otp + newPassword)
+  app.post("/api/mini-website/:subdomain/customer/reset-password", async (req, res) => {
+    try {
+      const { email, otp, newPassword, vendorId: inputVendorId } = req.body;
+      const { subdomain } = req.params;
+
+      if (!email || !otp || !newPassword) {
+        return res.status(400).json({ error: 'Email, OTP, and new password are required' });
+      }
+
+      if (newPassword.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+      }
+
+      const normalizedEmail = email.toLowerCase();
+
+      // Get mini-website
+      const miniWebsite = await storage.getMiniWebsiteBySubdomain(subdomain);
+      if (!miniWebsite) {
+        return res.status(404).json({ error: "Website not found" });
+      }
+
+      // Use input vendorId if provided, otherwise use from miniWebsite
+      const vendorId = inputVendorId || miniWebsite.vendorId;
+
+      // Validate vendorId matches the website's vendor
+      if (inputVendorId && inputVendorId !== miniWebsite.vendorId) {
+        console.log(`[Customer Auth] VendorId mismatch: input=${inputVendorId}, website=${miniWebsite.vendorId}`);
+        return res.status(400).json({ error: 'Invalid vendor' });
+      }
+
+      // Get token from database
+      const { supabaseStorage } = await import('./supabaseStorage');
+      const token = await supabaseStorage.getPasswordResetToken(normalizedEmail, otp);
+
+      if (!token) {
+        return res.status(400).json({ error: 'Invalid OTP. Please request a new OTP.' });
+      }
+
+      // Check if this token is for the correct vendor (if vendorId is set)
+      if (token.vendorId && token.vendorId !== vendorId) {
+        return res.status(400).json({ error: 'Invalid OTP for this website.' });
+      }
+
+      // Check if OTP has expired
+      if (new Date() > new Date(token.expiresAt)) {
+        await supabaseStorage.markPasswordResetTokenUsed(normalizedEmail, otp);
+        return res.status(400).json({ error: 'OTP has expired. Please request a new OTP.' });
+      }
+
+      // Check if OTP was verified
+      if (!token.verified) {
+        return res.status(400).json({ error: 'OTP has not been verified. Please verify your OTP first.' });
+      }
+
+      // Find user
+      const user = await storage.getUserByEmail(normalizedEmail);
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      // Hash new password
+      const { hashPassword } = await import('./auth');
+      const passwordHash = await hashPassword(newPassword);
+
+      // Update user password
+      await storage.updateUser(user.id, { passwordHash });
+
+      // Mark OTP as used
+      await supabaseStorage.markPasswordResetTokenUsed(normalizedEmail, otp);
+
+      console.log(`✅ [Customer Auth] Password reset successful for ${normalizedEmail} with vendor ${vendorId}`);
+
+      res.json({ 
+        success: true, 
+        message: 'Password has been reset successfully. You can now login with your new password.',
+        vendorId: vendorId,
+        email: normalizedEmail
+      });
+    } catch (error: any) {
+      console.error("[Customer Auth] Password reset error:", error);
+      res.status(500).json({ error: error.message || 'Failed to reset password' });
     }
   });
 
@@ -5677,10 +6070,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
       if (industries) filters.industries = (industries as string).split(',');
       if (isTrending !== undefined) filters.isTrending = isTrending === 'true';
       
+      console.log('[API] Fetching greeting templates with filters:', filters);
       const templates = await storage.getAllGreetingTemplates(filters);
+      console.log(`[API] Found ${templates.length} greeting templates`);
       res.json(templates);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch greeting templates" });
+    } catch (error: any) {
+      console.error('[API] Failed to fetch greeting templates:', error);
+      res.status(500).json({ 
+        error: "Failed to fetch greeting templates",
+        details: error?.message || String(error)
+      });
     }
   });
 
@@ -5714,18 +6113,50 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Upload greeting template image to Supabase S3
+  app.post("/api/greeting-templates/upload-image", createUploadMiddleware(), async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+      
+      // Upload to admin posters category
+      const result = await handleFileUpload(req.file, {
+        vendorId: "admin",
+        category: "posters",
+        isPrivate: false,
+      });
+      
+      console.log('[API] Greeting template image uploaded:', result.url);
+      res.json(result);
+    } catch (error) {
+      console.error("Greeting template image upload error:", error);
+      const message = error instanceof Error ? error.message : "Failed to upload image";
+      res.status(400).json({ error: message });
+    }
+  });
+
   // Create greeting template (Admin only)
   app.post("/api/greeting-templates", async (req, res) => {
     try {
+      console.log('[API] Creating greeting template:', req.body.title);
       const validatedData = insertGreetingTemplateSchema.parse(req.body);
       const template = await storage.createGreetingTemplate(validatedData);
+      console.log('[API] Greeting template created:', template.id);
       res.status(201).json(template);
-    } catch (error) {
-      console.error("Template creation error:", error);
-      res.status(400).json({ 
-        error: "Invalid template data",
-        details: error instanceof Error ? error.message : String(error)
-      });
+    } catch (error: any) {
+      console.error("[API] Template creation error:", error);
+      if (error.name === 'ZodError') {
+        res.status(400).json({ 
+          error: "Invalid template data",
+          details: error.errors
+        });
+      } else {
+        res.status(500).json({ 
+          error: "Failed to create template",
+          details: error?.message || String(error)
+        });
+      }
     }
   });
 
@@ -7117,8 +7548,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       // Initialize Razorpay
       const razorpay = new Razorpay({
-        key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_RhHdGgNx7Uu3Rf',
-        key_secret: process.env.RAZORPAY_KEY_SECRET || 'vCCsk3Ik5YYplYYWWLTqSHKv'
+        key_id: process.env.RAZORPAY_KEY_ID || 'rzp_live_RugtddoC1ALdFB',
+        key_secret: process.env.RAZORPAY_KEY_SECRET || 'IHP66Sd1fwviFAG0ESRYOeua'
       });
 
       // Create Razorpay order
@@ -7148,7 +7579,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         amount: order.amount,
         currency: order.currency,
         subscriptionId: subscription.id,
-        razorpayKeyId: process.env.RAZORPAY_KEY_ID || 'rzp_test_RhHdGgNx7Uu3Rf'
+        razorpayKeyId: process.env.RAZORPAY_KEY_ID || 'rzp_live_RugtddoC1ALdFB'
       });
 
     } catch (error: any) {
@@ -7200,8 +7631,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       try {
         // Fetch order details from Razorpay to get the amount
         const razorpay = new Razorpay({
-          key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_RhHdGgNx7Uu3Rf',
-          key_secret: process.env.RAZORPAY_KEY_SECRET || 'vCCsk3Ik5YYplYYWWLTqSHKv'
+          key_id: process.env.RAZORPAY_KEY_ID || 'rzp_live_RugtddoC1ALdFB',
+          key_secret: process.env.RAZORPAY_KEY_SECRET || 'IHP66Sd1fwviFAG0ESRYOeua'
         });
 
         let orderAmount = '0';
@@ -7853,6 +8284,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Get single additional service by ID
+  app.get("/api/additional-services/:id", async (req, res) => {
+    try {
+      const service = await storage.getAdditionalServiceById?.(req.params.id);
+      if (!service) {
+        return res.status(404).json({ error: "Service not found" });
+      }
+      res.json(service);
+    } catch (error) {
+      console.error("Error fetching additional service:", error);
+      res.status(500).json({ error: "Failed to fetch service" });
+    }
+  });
+
   // Get all additional services (admin)
   app.get("/api/admin/additional-services", async (req, res) => {
     try {
@@ -7935,6 +8380,49 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
+  // Get vendor's own inquiries
+  app.get("/api/vendors/:vendorId/additional-service-inquiries", async (req, res) => {
+    try {
+      const { vendorId } = req.params;
+      const inquiries = await storage.getVendorAdditionalServiceInquiries?.(vendorId) || [];
+      res.json(inquiries);
+    } catch (error) {
+      console.error("Error fetching vendor inquiries:", error);
+      res.status(500).json({ error: "Failed to fetch inquiries" });
+    }
+  });
+
+  // Update inquiry status (admin)
+  app.patch("/api/admin/additional-service-inquiries/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status, adminNotes } = req.body;
+      
+      const updateData: any = { updatedAt: new Date() };
+      if (status) {
+        updateData.status = status;
+        if (status === "contacted") {
+          updateData.contactedAt = new Date();
+        }
+        if (status === "completed") {
+          updateData.completedAt = new Date();
+        }
+      }
+      if (adminNotes !== undefined) {
+        updateData.adminNotes = adminNotes;
+      }
+
+      const inquiry = await storage.updateAdditionalServiceInquiry?.(id, updateData);
+      if (!inquiry) {
+        return res.status(404).json({ error: "Inquiry not found" });
+      }
+      res.json(inquiry);
+    } catch (error) {
+      console.error("Error updating inquiry:", error);
+      res.status(500).json({ error: "Failed to update inquiry" });
+    }
+  });
+
   // ====================
   // AUTHENTICATION ROUTES
   // ====================
@@ -7946,11 +8434,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post("/api/auth/signout", signOut);
   app.post("/api/auth/logout", signOut); // Alias for signout
 
-  // Import authenticateToken middleware
-  const { authenticateToken } = await import('./auth');
+  // Import authenticateToken middleware and password reset handlers
+  const { authenticateToken, requestPasswordReset, verifyResetOTP, resetPassword } = await import('./auth');
   
   // Get current user endpoint (protected)
   app.get("/api/auth/me", authenticateToken, getCurrentUser);
+
+  // Password reset endpoints
+  app.post("/api/auth/forgot-password", requestPasswordReset);
+  app.post("/api/auth/verify-otp", verifyResetOTP);
+  app.post("/api/auth/reset-password", resetPassword);
 
   // ====================
   // PROMO BANNERS MODULE (Admin managed)

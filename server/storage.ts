@@ -654,6 +654,7 @@ export interface IStorage {
   // Additional Services
   getAllAdditionalServices?(activeOnly?: boolean): Promise<AdditionalService[]>;
   getAdditionalService?(id: string): Promise<AdditionalService | undefined>;
+  getAdditionalServiceById?(id: string): Promise<AdditionalService | undefined>;
   createAdditionalService?(service: InsertAdditionalService): Promise<AdditionalService>;
   updateAdditionalService?(id: string, updates: Partial<InsertAdditionalService>): Promise<AdditionalService | undefined>;
   deleteAdditionalService?(id: string): Promise<boolean>;
@@ -661,6 +662,7 @@ export interface IStorage {
   // Additional Service Inquiries
   getAllAdditionalServiceInquiries?(): Promise<AdditionalServiceInquiry[]>;
   getAdditionalServiceInquiry?(id: string): Promise<AdditionalServiceInquiry | undefined>;
+  getVendorAdditionalServiceInquiries?(vendorId: string): Promise<AdditionalServiceInquiry[]>;
   createAdditionalServiceInquiry?(inquiry: InsertAdditionalServiceInquiry): Promise<AdditionalServiceInquiry>;
   updateAdditionalServiceInquiry?(id: string, updates: Partial<InsertAdditionalServiceInquiry>): Promise<AdditionalServiceInquiry | undefined>;
 }
@@ -6852,6 +6854,10 @@ export class MemStorage implements IStorage {
     return this.additionalServices.get(id);
   }
 
+  async getAdditionalServiceById(id: string): Promise<AdditionalService | undefined> {
+    return this.additionalServices.get(id);
+  }
+
   async createAdditionalService(service: InsertAdditionalService): Promise<AdditionalService> {
     const id = randomUUID();
     const now = new Date();
@@ -6888,6 +6894,12 @@ export class MemStorage implements IStorage {
 
   async getAdditionalServiceInquiry(id: string): Promise<AdditionalServiceInquiry | undefined> {
     return this.additionalServiceInquiries.get(id);
+  }
+
+  async getVendorAdditionalServiceInquiries(vendorId: string): Promise<AdditionalServiceInquiry[]> {
+    return Array.from(this.additionalServiceInquiries.values())
+      .filter(inquiry => inquiry.vendorId === vendorId)
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }
 
   async createAdditionalServiceInquiry(inquiry: InsertAdditionalServiceInquiry): Promise<AdditionalServiceInquiry> {
@@ -7879,6 +7891,26 @@ class HybridStorage implements IStorage {
     return this.supabaseStorage.deleteExpense!(id);
   }
 
+  searchExpenses(vendorId: string, query: string): Promise<Expense[]> {
+    console.log('[DATABASE] Searching expenses in PostgreSQL:', vendorId, query);
+    return this.supabaseStorage.searchExpenses!(vendorId, query);
+  }
+
+  getRecurringExpenses(vendorId: string): Promise<Expense[]> {
+    console.log('[DATABASE] Fetching recurring expenses from PostgreSQL:', vendorId);
+    return this.supabaseStorage.getRecurringExpenses!(vendorId);
+  }
+
+  getUpcomingRecurringExpenses(vendorId: string, daysAhead?: number): Promise<Expense[]> {
+    console.log('[DATABASE] Fetching upcoming recurring expenses from PostgreSQL:', vendorId);
+    return this.supabaseStorage.getUpcomingRecurringExpenses!(vendorId, daysAhead);
+  }
+
+  getExpensesBySupplier(supplierId: string): Promise<Expense[]> {
+    console.log('[DATABASE] Fetching expenses by supplier from PostgreSQL:', supplierId);
+    return this.supabaseStorage.getExpensesBySupplier!(supplierId);
+  }
+
   // Lead methods - NOW USING DATABASE! 💾
   getLead(id: string): Promise<Lead | undefined> {
     return this.supabaseStorage.getLead!(id);
@@ -7919,26 +7951,30 @@ class HybridStorage implements IStorage {
     return this.supabaseStorage.deleteLead!(id);
   }
 
-  // Demo Request methods (using memStorage for now)
+  // Demo Request methods (connected to Supabase database)
   getDemoRequest(id: string): Promise<DemoRequest | undefined> {
-    return this.memStorage.getDemoRequest(id);
+    console.log('[DATABASE] Fetching demo request from PostgreSQL:', id);
+    return this.supabaseStorage.getDemoRequest!(id);
   }
 
   getAllDemoRequests(filters?: { status?: string }): Promise<DemoRequest[]> {
-    return this.memStorage.getAllDemoRequests(filters);
+    console.log('[DATABASE] Fetching all demo requests from PostgreSQL');
+    return this.supabaseStorage.getAllDemoRequests!(filters);
   }
 
   createDemoRequest(demoRequest: InsertDemoRequest): Promise<DemoRequest> {
-    console.log('[STORAGE] Creating demo request');
-    return this.memStorage.createDemoRequest(demoRequest);
+    console.log('[DATABASE] Creating demo request in PostgreSQL');
+    return this.supabaseStorage.createDemoRequest!(demoRequest);
   }
 
   updateDemoRequest(id: string, updates: Partial<InsertDemoRequest>): Promise<DemoRequest | undefined> {
-    return this.memStorage.updateDemoRequest(id, updates);
+    console.log('[DATABASE] Updating demo request in PostgreSQL:', id);
+    return this.supabaseStorage.updateDemoRequest!(id, updates);
   }
 
   deleteDemoRequest(id: string): Promise<boolean> {
-    return this.memStorage.deleteDemoRequest(id);
+    console.log('[DATABASE] Deleting demo request from PostgreSQL:', id);
+    return this.supabaseStorage.deleteDemoRequest!(id);
   }
 
   getLeadCommunication(id: string): Promise<LeadCommunication | undefined> {
@@ -8082,11 +8118,13 @@ class HybridStorage implements IStorage {
   }
 
   getStockMovementsByProduct(vendorProductId: string): Promise<StockMovement[]> {
-    return this.memStorage.getStockMovementsByProduct(vendorProductId);
+    console.log('[DATABASE] Fetching stock movements by product from PostgreSQL:', vendorProductId);
+    return this.supabaseStorage.getStockMovementsByProduct!(vendorProductId);
   }
 
-  getStockMovementsByVendor(vendorId: string): Promise<StockMovement[]> {
-    return this.memStorage.getStockMovementsByVendor(vendorId);
+  getStockMovementsByVendor(vendorId: string, filters?: { productId?: string; movementType?: string; startDate?: Date; endDate?: Date }): Promise<StockMovement[]> {
+    console.log('[DATABASE] Fetching stock movements by vendor from PostgreSQL:', vendorId);
+    return this.supabaseStorage.getStockMovementsByVendor!(vendorId, filters);
   }
 
   createStockMovement(movement: InsertStockMovement): Promise<StockMovement> {
@@ -8464,6 +8502,11 @@ class HybridStorage implements IStorage {
     return this.supabaseStorage.getAdditionalService!(id);
   }
 
+  getAdditionalServiceById(id: string): Promise<AdditionalService | undefined> {
+    console.log('[DATABASE] Fetching additional service by ID from PostgreSQL:', id);
+    return this.supabaseStorage.getAdditionalService!(id);
+  }
+
   createAdditionalService(service: InsertAdditionalService): Promise<AdditionalService> {
     console.log('[DATABASE] Creating additional service in PostgreSQL');
     return this.supabaseStorage.createAdditionalService!(service);
@@ -8488,6 +8531,11 @@ class HybridStorage implements IStorage {
   getAdditionalServiceInquiry(id: string): Promise<AdditionalServiceInquiry | undefined> {
     console.log('[DATABASE] Fetching additional service inquiry from PostgreSQL:', id);
     return this.supabaseStorage.getAdditionalServiceInquiry!(id);
+  }
+
+  getVendorAdditionalServiceInquiries(vendorId: string): Promise<AdditionalServiceInquiry[]> {
+    console.log('[DATABASE] Fetching vendor additional service inquiries from PostgreSQL:', vendorId);
+    return this.supabaseStorage.getVendorAdditionalServiceInquiries?.(vendorId) || Promise.resolve([]);
   }
 
   createAdditionalServiceInquiry(inquiry: InsertAdditionalServiceInquiry): Promise<AdditionalServiceInquiry> {
